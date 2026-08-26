@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+.env.local
+
+# Personal data. Your Letterboxd export contains your full watch history and
+# your written reviews; this repo is public, so it stays on disk only. Delete
+# these two lines if you ever want it versioned (and consider going private).
+data/letterboxd-*/
+data/*.zip
+
+# Generated state (rebuildable from data/ + network)
+db/
+var/
+*.db
+*.db-wal
+*.db-shm
+
+# Downloaded / derived artifacts
+data/cache/
+data/external/
+data/_archive/
+
+# OS
+.DS_Store
+.streamlit/secrets.toml

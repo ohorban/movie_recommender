@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "movierec"
+version = "0.1.0"
+description = "A personal, multi-stage hybrid movie recommender built on Letterboxd history."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Alex Ohorban" }]
+keywords = ["recommender", "letterboxd", "movies", "embeddings"]
+
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "requests>=2.31",
+  "tenacity>=8.2",
+  "python-dotenv>=1.0",
+  "rapidfuzz>=3.6",
+  "scikit-learn>=1.4",
+  "scipy>=1.11",
+  "anthropic>=0.40",
+  "tqdm>=4.66",
+  "platformdirs>=4.2",
+]
+
+[project.optional-dependencies]
+embed = ["sentence-transformers>=3.0", "torch>=2.2"]
+app = ["streamlit>=1.50", "altair>=5.3"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "mypy>=1.10", "types-requests"]
+all = ["movierec[embed,app,dev]"]
+
+[project.scripts]
+movierec = "movierec.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/movierec"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = [
+  "E501",    # line length is left to the formatter
+  "B008",    # calls in argument defaults (dataclass field factories)
+  "E702",    # short paired statements in Streamlit callbacks read better inline
+  "B905",    # several zips are intentionally ragged (UI columns vs items)
+  "SIM102",  # a nested if is often clearer than a compound condition
+  "SIM117",  # nested `with` is idiomatic in Streamlit layout blocks
+  "RUF001", "RUF002", "RUF003",  # unicode punctuation is deliberate in prompts
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+  "network: requires outbound network access (skipped by default)",
+  "slow: long-running test",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
