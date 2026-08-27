@@ -51,13 +51,22 @@ cp .env.example .env
 ### 2. Install
 
 ```bash
-uv venv && source .venv/bin/activate
-make dev-install          # or: uv pip install -e ".[embed,app,dev]"
+make dev-install
+```
+
+That creates `.venv` and installs everything. No `activate` needed — every `make` target runs the
+venv's own binaries. If `uv` is missing:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 `[embed]` pulls in PyTorch and sentence-transformers (~2 GB). Without it the system falls back to a
 hash-based encoder that has no semantic understanding — usable for a smoke test, not for real
 recommendations.
+
+`make doctor` checks the environment, your keys and the database at any point.
 
 ### 3. Add your Letterboxd export
 
@@ -180,10 +189,13 @@ tab lists them. Corrections are permanent and survive a full rebuild.
 ## Development
 
 ```bash
-make test        # 125 tests, no network required
+make test        # 127 tests, no network required
 make lint
 make fmt
+make doctor      # environment, keys and database health
 ```
+
+Python 3.12 by default; override with `make dev-install PYTHON_VERSION=3.11`.
 
 The test suite runs the real pipeline end to end against stand-in TMDB and Claude clients, so a
 break anywhere in the chain surfaces there rather than in production.

@@ -10,6 +10,20 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-27
+
+### Fixed
+- `make dev-install` failed with *"No virtual environment found"* on a clean checkout. The Makefile
+  assumed a `.venv` already existed and was activated. It now creates the environment on demand and
+  invokes the venv's own binaries throughout, so no `source .venv/bin/activate` is needed for any
+  target. A missing `uv` is reported with install instructions rather than `command not found`.
+
+### Added
+- `make doctor` — reports Python version, whether the embedding and web extras are installed,
+  whether the API keys are set, and the current database status.
+- `make venv` and `make distclean`; `PYTHON_VERSION` is overridable (default 3.12).
+- `make help` is now the default target.
+
 ## [0.1.0] — 2026-08-26
 
 First working version: the whole pipeline from Letterboxd export to ranked recommendations.
@@ -80,5 +94,6 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ohorban/movie_recommender/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ohorban/movie_recommender/releases/tag/v0.1.0
