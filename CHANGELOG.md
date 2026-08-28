@@ -10,6 +10,28 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-28
+
+### Fixed
+
+- **CI failed before running a single test.** `astral-sh/setup-uv@v3` with `enable-cache: true`
+  globs for a `uv.lock` by default; this project installs with `uv pip install -e .` rather than
+  `uv sync`, so there is none, and the cache step errored out. Pinned `cache-dependency-glob` to
+  `pyproject.toml`.
+- Bumped `actions/checkout` to v7 and `setup-uv` to v10.0.1, both of which run on Node 24 — the old
+  versions emitted the Node 20 deprecation warning. (`setup-uv` publishes no floating `v10` tag, so
+  the exact version is pinned.)
+
+- **The end-to-end tests had never run in CI.** They require a Letterboxd export and `data/` is
+  git-ignored, so on a clean checkout all 21 skipped and CI would have passed on 156 of 177 tests —
+  with none of the pipeline, resolution, taste-model, leakage or retrieval coverage. `conftest` now
+  generates a realistic 520-film export when none is present, reproducing the format's real
+  awkwardness (film URIs vs entry URIs, the two-block list CSV, rewatch duplicates). A CI step fails
+  the build if those tests ever silently skip again.
+
+### Changed
+- CI matrix is now 3.10, 3.12 and 3.13 — verified locally on all three.
+
 ## [0.1.5] — 2026-08-28
 
 ### Fixed
@@ -202,7 +224,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/ohorban/movie_recommender/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ohorban/movie_recommender/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ohorban/movie_recommender/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ohorban/movie_recommender/compare/v0.1.2...v0.1.3

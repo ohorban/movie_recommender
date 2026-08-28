@@ -25,9 +25,9 @@ from movierec.recommend.engine import RecommendationEngine
 
 
 @pytest.fixture
-def built(tmp_config, conn, real_export):
+def built(tmp_config, conn, library_export):
     """A fully built database, from the user's actual export."""
-    shutil.copytree(real_export, tmp_config.data_dir / real_export.name)
+    shutil.copytree(library_export, tmp_config.data_dir / library_export.name)
     tmdb = FakeTMDBClient(n_movies=600, min_year=2000, max_year=2026)
     claude = FakeClaudeClient()
     backend = HashBackend(dim=128)
@@ -284,9 +284,9 @@ def test_status_reports_a_built_database(built):
     assert out["embeddings"] > 100
 
 
-def test_pipeline_survives_a_missing_llm(tmp_config, conn, real_export):
+def test_pipeline_survives_a_missing_llm(tmp_config, conn, library_export):
     """Without Claude the system must still build and recommend, just with less insight."""
-    shutil.copytree(real_export, tmp_config.data_dir / real_export.name)
+    shutil.copytree(library_export, tmp_config.data_dir / library_export.name)
     report = run(
         tmp_config,
         kind="setup",

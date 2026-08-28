@@ -273,7 +273,13 @@ Every external dependency degrades rather than breaks:
 
 ## Testing
 
-125 tests, no network required.
+177 tests, no network required, on Python 3.10 / 3.12 / 3.13.
+
+The end-to-end suite needs a Letterboxd export, and `data/` is git-ignored. For a long time that
+meant every one of those tests skipped on a clean checkout — CI was green while testing barely half
+the code. `conftest` now generates a realistic export when the real one is absent, and CI fails if
+those tests skip. A test that silently does not run is worse than no test, because it also removes
+the pressure to write one.
 
 The centrepiece is `test_pipeline_e2e.py`, which runs the **real** pipeline — real schema, real
 ingest, real resolution, real taste model, real ranker — against the actual Letterboxd export, with

@@ -16,33 +16,49 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # Pinned to an exact version: astral-sh does not publish a floating v10
+      # tag, and v3 ran on the now-deprecated Node 20.
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v10.0.1
         with:
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
+          # This project installs with `uv pip install -e .`, not `uv sync`, so
+          # there is no uv.lock. Left at its default the cache step globs for
+          # one, finds nothing, and fails the job.
+          cache-dependency-glob: "pyproject.toml"
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-
+      # The `embed` and `app` extras are deliberately excluded: the suite runs
+      # on the offline hash backend, so CI needs no model download and no
+      # network access at all.
       - name: Install
-        run: |
-          uv venv --python ${{ matrix.python-version }}
-          uv pip install -e ".[dev]"
+        run: uv pip install --system -e ".[dev]"
 
-      # The embedding and app extras are deliberately excluded: CI runs against
-      # the offline hash backend, so no model download and no network is needed.
       - name: Lint
         run: |
-          uv run ruff check src tests app
-          uv run ruff format --check src tests app
+          ruff check src tests app
+          ruff format --check src tests app
 
       - name: Test
-        run: uv run pytest -q --cov=movierec --cov-report=term-missing
+        run: pytest --cov=movierec --cov-report=term-missing
 
-      - name: Check the CLI is importable and wired up
-        run: uv run movierec --version
+      # The end-to-end tests cover ingestion, TMDB resolution, the taste model,
+      # the leakage guards and retrieval. They need a Letterboxd export, and
+      # `data/` is git-ignored — so on a clean checkout they used to skip
+      # silently and CI passed on barely half the suite. conftest now generates
+      # an export when none is present; this step makes sure that keeps working.
+      - name: Fail if the pipeline tests silently skipped
+        run: |
+          pytest tests/test_pipeline_e2e.py -rs --no-header | tee /tmp/e2e.txt
+          if grep -q "no Letterboxd export" /tmp/e2e.txt; then
+            echo "::error::end-to-end tests skipped for want of an export fixture"
+            exit 1
+          fi
+
+      - name: Check the CLI is wired up
+        run: movierec --version

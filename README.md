@@ -202,7 +202,12 @@ make fmt
 make doctor      # environment, keys and database health
 ```
 
-Python 3.12 by default; override with `make dev-install PYTHON_VERSION=3.11`.
+Python 3.12 by default; override with `make dev-install PYTHON_VERSION=3.11`. CI runs the suite on
+3.10, 3.12 and 3.13.
+
+The end-to-end tests need a Letterboxd export. `data/` is git-ignored, so on a clean checkout the
+fixture generates a realistic one instead — otherwise the whole pipeline suite would skip silently
+and CI would pass on half the tests.
 
 The test suite runs the real pipeline end to end against stand-in TMDB and Claude clients, so a
 break anywhere in the chain surfaces there rather than in production.
