@@ -18,6 +18,7 @@ import numpy as np
 
 from ..config import Config
 from ..db import fetch_all
+from ..enrich.coerce import normalize_pitches
 from ..enrich.embeddings import EmbeddingBackend, VectorStore, make_backend
 from ..enrich.llm import ClaudeClient
 from ..enrich.schemas import PITCH_SCHEMA
@@ -448,12 +449,12 @@ class RecommendationEngine:
             temperature=0.55,
             use_cache=False,
         )
-        by_id = {int(p.get("tmdb_id", -1)): p for p in payload.get("pitches", [])}
+        by_id = normalize_pitches(payload)
         for it in items:
-            p = by_id.get(it.tmdb_id) or {}
-            it.hook = str(p.get("hook") or "")
-            it.because = str(p.get("because") or "")
-            it.caveat = str(p.get("caveat") or "")
+            pitch = by_id.get(it.tmdb_id) or {}
+            it.hook = pitch.get("hook", "")
+            it.because = pitch.get("because", "")
+            it.caveat = pitch.get("caveat", "")
 
     def _history_evidence(self, limit: int = 26) -> str:
         """Their strongest opinions, in their own words, for grounding pitches."""

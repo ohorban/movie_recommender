@@ -184,7 +184,20 @@ class FakeTMDBClient:
 
 
 class FakeClaudeClient:
-    """Returns schema-shaped payloads without touching the network."""
+    """Returns payloads shaped the way Claude actually shapes them.
+
+    Deliberately imperfect. A tool-use `input_schema` constrains what the model
+    is asked for, not what it returns, and an earlier version of this fake
+    returned flawless payloads — which is precisely why three real
+    schema deviations reached production untested:
+
+    * a required array returned as ``null``
+    * an entry inside an array of objects returned as a JSON *string*
+    * a list field returned as a bare string
+
+    Each of those is now emitted on a deterministic slice of calls, so the
+    normalisation layer is exercised by every end-to-end run.
+    """
 
     def __init__(self, model: str = "fake-model") -> None:
         self.model = model
@@ -197,11 +210,18 @@ class FakeClaudeClient:
         self.calls.append(kind)
         rng = random.Random(abs(hash(user)) % (2**31))
         if kind == "review_facts":
-            return {
+            quirk = rng.randint(0, 9)
+            liked = [{"aspect": "unique concept", "category": "originality", "strength": 0.8}]
+            if quirk == 0:
+                # An entry arrives as a JSON string rather than an object.
+                liked.append(
+                    '{"aspect": "comforting tone", "category": "emotional_impact", "strength": 0.7}'
+                )
+            payload = {
                 "verdict": rng.choice(["loved", "liked", "mixed", "disliked"]),
                 "sentiment": round(rng.uniform(-1, 1), 2),
                 "signal_strength": round(rng.uniform(0.3, 1.0), 2),
-                "liked": [{"aspect": "unique concept", "category": "originality", "strength": 0.8}],
+                "liked": liked,
                 "disliked": [{"aspect": "slow middle", "category": "pacing", "strength": 0.4}],
                 "themes": ["identity", "sacrifice"],
                 "tone_words": ["tense", "warm"],
@@ -212,11 +232,20 @@ class FakeClaudeClient:
                 },
                 "taste_signals": ["values originality of premise over execution polish"],
             }
+            if quirk == 1:
+                # Required arrays come back null.
+                payload.update(liked=None, disliked=None, taste_signals=None, engagement=None)
+            elif quirk == 2:
+                # A list field comes back as a bare string.
+                payload["tone_words"] = "melancholy"
+            return payload
         if kind == "dossier":
+            quirk = rng.randint(0, 9)
             return {
                 "logline": "A person confronts an escalating problem.",
-                "tone": ["tense", "melancholy"],
-                "themes": ["obsession", "family"],
+                # Roughly one in eight real dossiers returned these as strings.
+                "tone": "tense" if quirk == 0 else ["tense", "melancholy"],
+                "themes": "obsession" if quirk == 1 else ["obsession", "family"],
                 "pacing": rng.choice(["slow", "measured", "brisk", "relentless"]),
                 "scales": {
                     k: round(rng.random(), 2)

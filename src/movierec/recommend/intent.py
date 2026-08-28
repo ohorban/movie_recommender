@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..db import fetch_all
+from ..enrich.coerce import as_float, as_obj, as_str, as_str_list
 from ..enrich.llm import ClaudeClient
 from ..enrich.schemas import INTENT_SCHEMA
 from ..logging_utils import get_logger
@@ -63,25 +64,34 @@ class Intent:
 
     @classmethod
     def from_payload(cls, raw: str, payload: dict[str, Any]) -> Intent:
-        scales = {
-            k: float(v) for k, v in (payload.get("target_scales") or {}).items() if v is not None
-        }
+        data = as_obj(payload)
+        scales: dict[str, float] = {}
+        for key, value in as_obj(data.get("target_scales")).items():
+            number = as_float(value)
+            if number is not None:
+                scales[str(key)] = max(0.0, min(1.0, number))
+
+        def _int(key: str) -> int | None:
+            number = as_float(data.get(key))
+            return int(number) if number is not None else None
+
+        novelty = as_str(data.get("novelty"), "balanced").lower()
         return cls(
             raw_text=raw,
-            semantic_query=str(payload.get("semantic_query") or raw),
-            interpretation=str(payload.get("interpretation") or ""),
-            include_genres=[str(g) for g in payload.get("include_genres") or []],
-            exclude_genres=[str(g) for g in payload.get("exclude_genres") or []],
-            keywords=[str(k) for k in payload.get("keywords") or []],
-            people=[str(p) for p in payload.get("people") or []],
-            year_min=payload.get("year_min"),
-            year_max=payload.get("year_max"),
-            runtime_max=payload.get("runtime_max"),
-            languages=[str(x) for x in payload.get("languages") or []],
-            novelty=str(payload.get("novelty") or "balanced"),
-            taste_weight=float(payload.get("taste_weight", 0.7)),
+            semantic_query=as_str(data.get("semantic_query")) or raw,
+            interpretation=as_str(data.get("interpretation")),
+            include_genres=as_str_list(data.get("include_genres")),
+            exclude_genres=as_str_list(data.get("exclude_genres")),
+            keywords=as_str_list(data.get("keywords")),
+            people=as_str_list(data.get("people")),
+            year_min=_int("year_min"),
+            year_max=_int("year_max"),
+            runtime_max=_int("runtime_max"),
+            languages=as_str_list(data.get("languages")),
+            novelty=novelty if novelty in {"familiar", "balanced", "obscure"} else "balanced",
+            taste_weight=max(0.0, min(1.0, as_float(data.get("taste_weight"), 0.7) or 0.7)),
             target_scales=scales,
-            allow_rewatch=bool(payload.get("allow_rewatch", False)),
+            allow_rewatch=bool(data.get("allow_rewatch", False)),
         )
 
     @classmethod

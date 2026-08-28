@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from ..db import fetch_all, transaction, utcnow
+from ..enrich.coerce import normalize_summary
 from ..enrich.llm import ClaudeClient
 from ..enrich.schemas import TASTE_SUMMARY_SCHEMA
 from ..logging_utils import get_logger
@@ -131,6 +132,7 @@ def generate_summary(
         log.warning("taste summary failed: %s", exc)
         return None
 
+    payload = normalize_summary(payload)
     profile.summary = payload
     rows = fetch_all(
         conn,

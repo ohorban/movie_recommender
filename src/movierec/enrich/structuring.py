@@ -24,11 +24,24 @@ from typing import Any
 from ..db import content_hash, fetch_all, transaction, upsert, utcnow
 from ..logging_utils import get_logger
 from ..text_utils import truncate
+from .coerce import normalize_dossier, normalize_review_facts
 from .documents import load_movie_documents
 from .llm import ClaudeClient
 from .schemas import DOSSIER_SCHEMA, REVIEW_FACTS_SCHEMA
 
 log = get_logger("enrich.structuring")
+
+DOSSIER_SCALES = [
+    "intellectual_demand",
+    "emotional_intensity",
+    "originality",
+    "feel_good",
+    "darkness",
+    "spectacle",
+    "realism",
+    "humor",
+    "tension",
+]
 
 ProgressFn = Callable[[str, float], None]
 
@@ -127,7 +140,7 @@ def structure_reviews(
         {
             "review_uri": row["review_uri"],
             "text_hash": row["text_hash"],
-            "payload_json": json.dumps(payload),
+            "payload_json": json.dumps(normalize_review_facts(payload)),
             "model": client.model,
             "generated_at": utcnow(),
         }
@@ -156,7 +169,7 @@ def load_review_facts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         try:
-            facts = json.loads(r["payload_json"])
+            facts = normalize_review_facts(json.loads(r["payload_json"]))
         except json.JSONDecodeError:
             continue
         fields = {k: r[k] for k in r.keys() if k != "payload_json"}  # noqa: SIM118 (sqlite3.Row)
@@ -229,7 +242,7 @@ def generate_dossiers(
     rows = [
         {
             "tmdb_id": tmdb_id,
-            "payload_json": json.dumps(payload),
+            "payload_json": json.dumps(normalize_dossier(payload, DOSSIER_SCALES)),
             "model": client.model,
             "input_hash": ihash,
             "generated_at": utcnow(),
@@ -264,20 +277,7 @@ def load_dossiers(
     out: dict[int, dict[str, Any]] = {}
     for r in rows:
         try:
-            out[r["tmdb_id"]] = json.loads(r["payload_json"])
+            out[r["tmdb_id"]] = normalize_dossier(json.loads(r["payload_json"]), DOSSIER_SCALES)
         except json.JSONDecodeError:
             continue
     return out
-
-
-DOSSIER_SCALES = [
-    "intellectual_demand",
-    "emotional_intensity",
-    "originality",
-    "feel_good",
-    "darkness",
-    "spectacle",
-    "realism",
-    "humor",
-    "tension",
-]

@@ -293,7 +293,12 @@ Tests that earned their keep during development, each of which caught a real bug
   ratings were cross-validated without rebuilding them per fold (see **Ranking** above).
 - `anthropic` 1.x removed `temperature` from `Messages.create`, so every LLM call raised. Keyword
   arguments are now filtered against the installed SDK's signature.
-- The *first* fix for that bug added the filter but never routed the call sites through it, and the
+- A tool-use schema does not validate the model's output. One entry inside an array of objects came
+  back as a JSON string (crash), and `tone`/`themes` came back as bare strings in 96 of 413
+  dossiers — which never crashed, it just iterated the string letter by letter. Everything now goes
+  through `enrich/coerce.py` on write *and* on read. The test client had been returning flawless
+  payloads, which is why none of it was caught; it now returns the messy shapes deliberately.
+- The *first* fix for the SDK bug added the filter but never routed the call sites through it, and the
   unit test checked the filter rather than the code path using it — so the test passed while
   production stayed broken. `tests/test_llm.py` now drives the real methods against stand-in SDKs
   and asserts at source level that no `messages.create` call bypasses the filter. A unit test of a

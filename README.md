@@ -196,7 +196,7 @@ tab lists them. Corrections are permanent and survive a full rebuild.
 ## Development
 
 ```bash
-make test        # 150 tests, no network required
+make test        # 177 tests, no network required
 make lint
 make fmt
 make doctor      # environment, keys and database health

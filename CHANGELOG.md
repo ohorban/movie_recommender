@@ -10,6 +10,35 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-28
+
+### Fixed
+
+- **`AttributeError: 'str' object has no attribute 'get'` killed the pipeline** at the taste-profile
+  stage, and the same error broke recommendation explanations. A tool-use `input_schema` constrains
+  what the model is *asked* for, not what it returns. Across one real run of 127 reviews and 413
+  dossiers, three deviations occurred:
+  - a required array returned as `null` (11 of 127 reviews) — already tolerated;
+  - one entry inside an array of objects returned as a **JSON string** rather than an object — the
+    crash;
+  - `tone` and `themes` returned as a **bare string** instead of a list (96 of 413 dossiers) — this
+    one never crashed. It iterated the string character by character, so a film's tone rendered as
+    "t, e, n, s, e" in the UI and in the prompts sent back to Claude.
+- Every LLM payload now passes through `movierec.enrich.coerce`, on the way in **and** on the way
+  out of the database. Normalising on read repairs the records already stored, so nothing needs
+  regenerating.
+- The natural-language intent parser was hardened the same way: enums constrained, numbers clamped,
+  list fields accepting a bare string.
+
+### Changed
+- **The test Claude client now returns imperfect payloads.** It previously returned flawless
+  schema-conformant output, which is exactly why all three deviations reached production untested.
+  It now emits each of them on a deterministic slice of calls. Verified to have teeth: removing the
+  normalisation layer fails 18 end-to-end tests.
+
+### Added
+- `tests/test_coerce.py` (27 tests), every case drawn from the observed payloads.
+
 ## [0.1.4] — 2026-08-28
 
 ### Fixed
@@ -173,7 +202,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/ohorban/movie_recommender/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ohorban/movie_recommender/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ohorban/movie_recommender/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ohorban/movie_recommender/compare/v0.1.1...v0.1.2
