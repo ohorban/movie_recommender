@@ -206,7 +206,7 @@ def fetch_plots(
     session: CachedSession,
     tmdb_ids: Sequence[int],
     *,
-    workers: int = 6,
+    workers: int = 8,
     batch_size: int = 100,
     progress: ProgressFn | None = None,
     progress_span: tuple[float, float] = (0.75, 0.85),

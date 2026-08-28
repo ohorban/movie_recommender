@@ -52,6 +52,8 @@ rebuild: $(MOVIEREC)  ## Destroy and rebuild the database (keeps manual match fi
 	$(MOVIEREC) rebuild --yes
 
 app: $(MOVIEREC)  ## Launch the web interface
+	@test -x $(STREAMLIT) || { \
+		echo "streamlit is not installed in $(VENV). Run:  make dev-install"; exit 1; }
 	$(STREAMLIT) run app/streamlit_app.py
 
 doctor: $(MOVIEREC)  ## Check the environment, keys and database

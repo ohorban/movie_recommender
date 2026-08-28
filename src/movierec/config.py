@@ -79,7 +79,7 @@ class Config:
     enable_wikipedia: bool = True
 
     # --- enrichment scope --------------------------------------------------
-    wikipedia_limit: int = 8_000  # films fetched eagerly; the rest lazily
+    wikipedia_limit: int = 3_000  # coverage target; the slowest stage by far
     dossier_seed_limit: int = 400  # user films profiled by Claude during setup
 
     # --- recommendation tuning --------------------------------------------
@@ -169,7 +169,7 @@ def load_config(root: Path | None = None, *, reload_env: bool = True) -> Config:
         enable_movielens=_as_bool(env("MOVIEREC_ENABLE_MOVIELENS"), True),
         enable_imdb=_as_bool(env("MOVIEREC_ENABLE_IMDB"), True),
         enable_wikipedia=_as_bool(env("MOVIEREC_ENABLE_WIKIPEDIA"), True),
-        wikipedia_limit=_as_int(env("MOVIEREC_WIKIPEDIA_LIMIT"), 8_000),
+        wikipedia_limit=_as_int(env("MOVIEREC_WIKIPEDIA_LIMIT"), 3_000),
         dossier_seed_limit=_as_int(env("MOVIEREC_DOSSIER_SEED_LIMIT"), 400),
         candidates_per_source=_as_int(env("MOVIEREC_CANDIDATES_PER_SOURCE"), 400),
         exploration_ratio=_as_float(env("MOVIEREC_EXPLORATION_RATIO"), 0.15),

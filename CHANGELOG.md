@@ -10,6 +10,27 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-08-28
+
+### Changed
+- **Rewrote the README** around how you actually use the thing: setup first, then the interface,
+  then a nine-step plain-language walkthrough of how the recommender works.
+- **`MOVIEREC_WIKIPEDIA_LIMIT` now defaults to 3,000, down from 8,000.** Measured at roughly 20
+  minutes per 1,000 films, the old default made the first build a 3–4 hour job, most of it in one
+  step. 3,000 covers the part of the catalog you are realistically shown. Raising it is one line.
+- Wikipedia fetching uses 8 workers instead of 6 — about a third faster, and rate limiting already
+  backs off safely.
+
+### Added
+- `LICENSE` (MIT). The README claimed a licence the repo did not carry. It also records the terms of
+  the four datasets the software downloads: TMDB, IMDb (non-commercial), MovieLens and Wikipedia.
+- `make app` now prints a one-line fix if Streamlit is missing, instead of a traceback.
+
+### Verified
+- A clean clone with no `.env`, no database and no Letterboxd export: installs, passes 176 tests
+  (1 skip, the one needing real data), reports missing keys clearly from both the CLI and
+  `make doctor`, and renders all four tabs with build instructions rather than crashing.
+
 ## [0.1.7] — 2026-08-28
 
 ### Fixed
@@ -241,7 +262,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/ohorban/movie_recommender/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/ohorban/movie_recommender/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/ohorban/movie_recommender/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ohorban/movie_recommender/compare/v0.1.4...v0.1.5
