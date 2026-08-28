@@ -23,9 +23,12 @@ transfer to films I have never seen.
 describes nobody: the midpoint of a war film and an animated musical is neither. Liked films are
 clustered into distinct modes, and a candidate only has to match one of them well.
 
-**Knows how much it knows.** The learned ranker is cross-validated and blended with a hand-tuned
-prior in proportion to how well it actually performs. When it has learned nothing, its influence
-goes to zero automatically rather than confidently ranking noise.
+**Knows how much it knows.** Every feature here is fitted on the very ratings the model predicts,
+which makes honest evaluation hard — the first version reported 0.96 rank correlation where the
+truth was 0.53. The taste profile is now rebuilt inside each cross-validation fold, and the learned
+model is blended with a hand-tuned prior in proportion to its held-out score. When it has learned
+nothing, its influence goes to zero rather than confidently ranking noise. At a few hundred ratings
+the prior often wins, and the Insights tab says so plainly.
 
 **Explains itself against my own history.** Every recommendation cites a specific film I rated or
 something I wrote, and says so when a pick is a genuine stretch.
@@ -189,7 +192,7 @@ tab lists them. Corrections are permanent and survive a full rebuild.
 ## Development
 
 ```bash
-make test        # 127 tests, no network required
+make test        # 133 tests, no network required
 make lint
 make fmt
 make doctor      # environment, keys and database health

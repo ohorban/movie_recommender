@@ -10,6 +10,45 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-08-28
+
+### Fixed
+
+- **Every Claude API call failed** with `Messages.create() got an unexpected keyword argument
+  'temperature'`. The `anthropic` 1.x SDK removed `temperature` and `top_p` from `Messages.create`.
+  Keyword arguments are now filtered against the installed SDK's actual signature at construction
+  time, so the same code runs on 0.x and 1.x. This had silently disabled review structuring, film
+  dossiers, the taste summary, natural-language intent parsing and all recommendation explanations.
+
+- **The ranker's reported accuracy was inflated by target leakage** — 0.96 rank correlation against
+  a true 0.53 on real data. Two independent causes, both now closed:
+  - Features are fitted on the ratings being predicted, so a rated film was scored partly against
+    itself: its own rating sat inside its director's affinity and inside the centroid of the taste
+    mode it belonged to. Training features are now built leave-one-out.
+  - Leave-one-out alone still reported ~0.91, because the profile was fitted once over every rating
+    and cross-validated on top. The taste profile is now rebuilt inside each fold, and held-out
+    films are featurised exactly as an unrated candidate would be.
+
+  This was not only a reporting problem: the blend weight is derived from that score, so the
+  system was fully trusting a model that had mostly memorised its own training set. On the
+  maintainer's data the honest evaluation now prefers the hand-tuned prior outright.
+
+- Streamlit's source watcher printed a traceback for every lazily-imported `transformers` submodule
+  with a missing optional dependency, burying the real logs. Disabled via `.streamlit/config.toml`.
+- `FutureWarning` from sentence-transformers 6's renamed `get_sentence_embedding_dimension`.
+- The test TMDB fake mutated its own state while iterating it, so concurrent resolution
+  intermittently lost a title.
+
+### Added
+- `tests/test_leakage.py` — trains on ratings drawn at random and asserts the evaluation finds no
+  signal, pinning the failure mode above.
+- The Insights tab reports the metric as held-out, explains what that means, and when the prior
+  wins it says so and shows the prior's weights instead of an empty table.
+
+### Changed
+- `TasteRanker.fit` accepts externally computed out-of-fold predictions; `TasteMode` records its
+  member films; `build_profile_from_prefs` builds a profile from an arbitrary subset of ratings.
+
 ## [0.1.1] — 2026-08-27
 
 ### Fixed
@@ -94,6 +133,7 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ohorban/movie_recommender/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ohorban/movie_recommender/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ohorban/movie_recommender/releases/tag/v0.1.0

@@ -186,26 +186,52 @@ agreement bonus.
 Seventeen features spanning embedding similarity (best mode, weighted modes, plot, repulsion),
 facet affinities, CF evidence, quality and popularity priors, dossier-scale fit and recency.
 
-Model selection is cross-validated on **Spearman rank correlation** — the ordering is what matters,
-not the predicted rating. Ridge on standardised features is fitted always; gradient boosting only
-when there are at least 80 examples. Whichever wins out-of-fold is kept.
+### The leakage problem
+
+Every one of those features is *fitted* on the ratings the model is trying to predict. That makes
+this system unusually easy to fool, and the first version was fooled badly: it reported a
+cross-validated rank correlation of **0.96** on real data where the honest figure was **0.53**.
+
+Two distinct leaks, both of which had to be closed:
+
+**A film scored against itself.** A director the user has seen exactly once has an affinity that is
+a pure function of that one film's rating; the model "learns" to read the label back out of the
+feature. The same applies to the centroid of the taste mode a film belongs to, and to the dislike
+centroid. Training features are therefore built **leave-one-out** — each film is scored against a
+profile with its own contribution subtracted (`affinity_value(..., exclude_pref=...)`,
+`_loo_mode_matrix`, `_loo_dislike`).
+
+**A profile fitted across folds.** Leave-one-out alone still reported ~0.91, because the affinities
+and centroids were computed once over every rating and the cross-validation ran on top of them —
+each fold's held-out films had helped build the signals they were then scored against. So the
+reported metric now comes from `_fold_predictions`, which **rebuilds the entire taste profile inside
+each fold** from that fold's training ratings only, and featurises the held-out films exactly as an
+unrated candidate is featurised at recommendation time.
+
+The lesson generalises: when your features are themselves fitted on the labels, cross-validating
+the final estimator tells you almost nothing. The fitting has to happen inside the fold.
+
+### Model selection
+
+Candidates are ridge on standardised features (always) and gradient boosting (at 80+ examples),
+scored by **Spearman rank correlation** on the honest out-of-fold predictions — the ordering is what
+matters, not the predicted rating. The hand-tuned heuristic competes as a third candidate on the
+same held-out basis, and on a few hundred ratings it frequently wins.
 
 The safeguard that matters most:
 
 ```python
-blend_weight = clip(cv_spearman / 0.45, 0, 1)
+blend_weight = clip(held_out_spearman / 0.45, 0, 1)
 final_score  = blend_weight × learned + (1 - blend_weight) × heuristic
 ```
 
-If cross-validation says the model learned nothing, its influence goes to zero and a hand-tuned
-prior takes over. `test_ranker.py` asserts this directly by fitting against pure noise.
+If the honest evaluation says the model learned nothing, its influence goes to zero and the prior
+takes over. `tests/test_leakage.py` asserts this directly by training on ratings drawn at random.
 
 Training also removes each film's own CF contribution, so a film cannot predict itself.
 
 Final selection is MMR-diversified over the embedding space, so the list is not five variations of
 one film.
-
----
 
 ## The intent layer
 
@@ -263,3 +289,7 @@ Tests that earned their keep during development, each of which caught a real bug
   reported a flawless model precisely when every candidate scored the same.
 - `embed_reviews` silently overwrote `embed_movies`' stats key, corrupting the update report.
 - Two identically-scoring match candidates landed exactly *on* the auto-accept threshold.
+- The ranker reported 0.96 rank correlation against a true 0.53, because features fitted on the
+  ratings were cross-validated without rebuilding them per fold (see **Ranking** above).
+- `anthropic` 1.x removed `temperature` from `Messages.create`, so every LLM call raised. Keyword
+  arguments are now filtered against the installed SDK's signature.

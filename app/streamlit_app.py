@@ -485,8 +485,19 @@ with tab_insights:
                     text=f"Learned model influence: {m.blend_weight:.0%} "
                     f"(the rest is the hand-tuned prior — this rises as you rate more films)",
                 )
+                if m.model_kind == "heuristic":
+                    st.caption(
+                        "No learned model beat the hand-tuned prior on held-out data, so the prior "
+                        "is doing the ranking. This is expected at a few hundred ratings and "
+                        "resolves itself as you rate more."
+                    )
                 if m.top_features:
-                    st.markdown("**What actually predicts your rating**")
+                    label = (
+                        "**Weights the prior uses**"
+                        if m.model_kind == "heuristic"
+                        else "**What actually predicts your rating**"
+                    )
+                    st.markdown(label)
                     st.dataframe(
                         {
                             "signal": [f for f, _ in m.top_features],

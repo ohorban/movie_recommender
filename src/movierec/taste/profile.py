@@ -61,6 +61,9 @@ class TasteMode:
     exemplars: list[dict[str, Any]] = field(default_factory=list)
     top_tags: list[str] = field(default_factory=list)
     top_genres: list[str] = field(default_factory=list)
+    # Which films are in this mode. Needed to rebuild the centroid without any
+    # one of them, which is what keeps the training features leakage-free.
+    member_ids: list[int] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,7 @@ class TasteMode:
             "exemplars": self.exemplars,
             "top_tags": self.top_tags,
             "top_genres": self.top_genres,
+            "member_ids": self.member_ids,
         }
 
 
@@ -89,6 +93,10 @@ class TasteProfile:
     taste_signals: list[str] = field(default_factory=list)
     summary: dict[str, Any] | None = None
     embed_model: str = ""
+    dislike_member_ids: list[int] = field(default_factory=list)
+    # Raw statistics behind `affinities`, used only to build leakage-free
+    # training features. Not serialised: training always follows a fresh build.
+    affinity_stats: AffinityStats = field(default_factory=dict, repr=False)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -107,6 +115,7 @@ class TasteProfile:
             "taste_signals": self.taste_signals,
             "summary": self.summary,
             "embed_model": self.embed_model,
+            "dislike_member_ids": self.dislike_member_ids,
         }
 
     def affinity(self, facet: str, name: str) -> float:
@@ -236,29 +245,59 @@ def runtime_bucket(minutes: int | None) -> str:
     return "over-160"
 
 
-def compute_affinities(
-    prefs: dict[int, float], facets: dict[int, dict[str, list[str]]]
-) -> dict[str, dict[str, float]]:
-    """Shrunk mean preference per facet value.
+AffinityStats = dict[str, dict[str, tuple[float, int]]]
 
-    ``affinity = mean_preference * n / (n + k)`` - an empirical-Bayes shrink
-    toward zero, so one lucky hit never outranks a consistent pattern.
+
+def compute_affinity_stats(
+    prefs: dict[int, float], facets: dict[int, dict[str, list[str]]]
+) -> AffinityStats:
+    """Per facet value, the (sum of preference, count) that back its affinity.
+
+    Kept separately from the affinities themselves so that training can
+    subtract a film's own contribution - see :func:`affinity_value`.
     """
-    sums: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    acc: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
     for tmdb_id, pref in prefs.items():
         for facet, values in facets.get(tmdb_id, {}).items():
             for value in set(values):
-                sums[facet][value].append(pref)
+                cell = acc[facet][value]
+                cell[0] += pref
+                cell[1] += 1
+    return {f: {v: (c[0], int(c[1])) for v, c in d.items()} for f, d in acc.items()}
 
-    out: dict[str, dict[str, float]] = {}
-    for facet, values in sums.items():
-        k = SHRINK_K.get(facet, 3.0)
-        scored = {}
-        for value, points in values.items():
-            n = len(points)
-            scored[value] = float(np.mean(points) * (n / (n + k)))
-        out[facet] = scored
-    return out
+
+def affinity_value(
+    stats: AffinityStats, facet: str, value: str, *, exclude_pref: float | None = None
+) -> float:
+    """Shrunk mean preference for one facet value.
+
+    ``affinity = mean_preference * n / (n + k)`` - an empirical-Bayes shrink
+    toward zero, so one lucky hit never outranks a consistent pattern.
+
+    ``exclude_pref`` removes a single film's own contribution. This is what
+    makes the training features honest: without it, a director seen exactly
+    once has an affinity that is a direct function of that film's rating, and
+    the model "predicts" the label by reading it back out of the feature.
+    """
+    total, n = stats.get(facet, {}).get(value, (0.0, 0))
+    if exclude_pref is not None:
+        total -= exclude_pref
+        n -= 1
+    if n <= 0:
+        return 0.0
+    k = SHRINK_K.get(facet, 3.0)
+    return float((total / n) * (n / (n + k)))
+
+
+def affinities_from_stats(stats: AffinityStats) -> dict[str, dict[str, float]]:
+    return {f: {v: affinity_value(stats, f, v) for v in d} for f, d in stats.items()}
+
+
+def compute_affinities(
+    prefs: dict[int, float], facets: dict[int, dict[str, list[str]]]
+) -> dict[str, dict[str, float]]:
+    """Shrunk mean preference per facet value, over every rated film."""
+    return affinities_from_stats(compute_affinity_stats(prefs, facets))
 
 
 # --------------------------------------------------------------------------- #
@@ -370,6 +409,7 @@ def _make_mode(mode_id, member_ids, centroid, weight, facets, titles) -> TasteMo
         exemplars,
         top_tags,
         top_genres,
+        [int(i) for i in member_ids],
     )
 
 
@@ -456,35 +496,70 @@ def scale_preferences(
 # --------------------------------------------------------------------------- #
 # Assembly
 # --------------------------------------------------------------------------- #
+def build_profile_from_prefs(
+    conn: sqlite3.Connection,
+    prefs: dict[int, float],
+    embed_model: str,
+    *,
+    titles: dict[int, tuple[str, int | None, float]] | None = None,
+    review_rows: list[dict[str, Any]] | None = None,
+    n_rated: int | None = None,
+) -> TasteProfile:
+    """Build a taste profile from an explicit set of preferences.
+
+    Factored out of :func:`build_profile` so that cross-validation can rebuild
+    the profile from a subset of the ratings. That matters more than it looks:
+    the affinities, the taste centroids and the scale targets are all *fitted*
+    quantities. Computing them once over every rating and then cross-validating
+    the ranker on top inflates the score badly, because each fold's held-out
+    films helped build the very signals they are then scored against.
+    """
+    tmdb_ids = list(prefs.keys())
+    facets = load_movie_facets(conn, tmdb_ids)
+    vectors = _load_movie_vectors(conn, tmdb_ids, embed_model)
+    dossiers = load_dossiers(conn, tmdb_ids)
+    titles = titles or {}
+
+    profile = TasteProfile(
+        n_rated=n_rated if n_rated is not None else len(prefs),
+        n_reviewed=len(review_rows or []),
+        embed_model=embed_model,
+    )
+    profile.affinity_stats = compute_affinity_stats(prefs, facets)
+    profile.affinities = affinities_from_stats(profile.affinity_stats)
+    profile.modes = build_taste_modes(conn, prefs, vectors, facets, titles)
+    profile.scale_targets, profile.scale_weights = scale_preferences(prefs, dossiers)
+
+    if review_rows is not None:
+        profile.aspect_affinity, profile.taste_signals = aggregate_review_facts(review_rows)
+
+    dislike_ids = [i for i, p in prefs.items() if p <= DISLIKED_THRESHOLD and i in vectors]
+    if len(dislike_ids) >= 3:
+        profile.dislike_member_ids = [int(i) for i in dislike_ids]
+        profile.dislike_centroid = _normalize(
+            np.mean(np.vstack([vectors[i] for i in dislike_ids]), axis=0)
+        )
+    return profile
+
+
 def build_profile(
     conn: sqlite3.Connection, backend: EmbeddingBackend, *, store: bool = True
 ) -> TasteProfile:
     """Compute the full taste profile and persist it as a model artifact."""
     ratings = load_user_ratings(conn)
     prefs, mean, std = preference_scores(ratings)
-    tmdb_ids = list(prefs.keys())
-
-    facets = load_movie_facets(conn, tmdb_ids)
-    vectors = _load_movie_vectors(conn, tmdb_ids, backend.name)
     titles = {int(r["tmdb_id"]): (r["title"], r["year"], r["rating"]) for r in ratings}
-    facts_rows = load_review_facts(conn)
-    dossiers = load_dossiers(conn, tmdb_ids)
 
-    profile = TasteProfile(
+    profile = build_profile_from_prefs(
+        conn,
+        prefs,
+        backend.name,
+        titles=titles,
+        review_rows=load_review_facts(conn),
         n_rated=len(ratings),
-        n_reviewed=len(facts_rows),
-        rating_mean=mean,
-        rating_std=std,
-        embed_model=backend.name,
     )
-    profile.affinities = compute_affinities(prefs, facets)
-    profile.modes = build_taste_modes(conn, prefs, vectors, facets, titles)
-    profile.aspect_affinity, profile.taste_signals = aggregate_review_facts(facts_rows)
-    profile.scale_targets, profile.scale_weights = scale_preferences(prefs, dossiers)
-
-    disliked = [vectors[i] for i, p in prefs.items() if p <= DISLIKED_THRESHOLD and i in vectors]
-    if len(disliked) >= 3:
-        profile.dislike_centroid = _normalize(np.mean(np.vstack(disliked), axis=0))
+    profile.rating_mean = mean
+    profile.rating_std = std
 
     if store:
         save_profile(conn, profile)

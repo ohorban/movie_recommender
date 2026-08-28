@@ -121,8 +121,44 @@ class TasteRanker:
     _learned_std: float = 1.0
 
     # ------------------------------------------------------------------ fit
+    @staticmethod
+    def candidate_models(n_rows: int) -> dict[str, Any]:
+        """The models considered, given how much training data there is."""
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.linear_model import RidgeCV
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        candidates: dict[str, Any] = {
+            "ridge": make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-1, 3, 25))),
+        }
+        if n_rows >= 80:
+            candidates["gbdt"] = GradientBoostingRegressor(
+                n_estimators=180,
+                learning_rate=0.05,
+                max_depth=2,
+                subsample=0.85,
+                min_samples_leaf=8,
+                random_state=17,
+            )
+        return candidates
+
     @classmethod
-    def fit(cls, fm: FeatureMatrix, targets: np.ndarray) -> TasteRanker:
+    def fit(
+        cls,
+        fm: FeatureMatrix,
+        targets: np.ndarray,
+        *,
+        oof: dict[str, np.ndarray] | None = None,
+    ) -> TasteRanker:
+        """Fit the ranker.
+
+        ``oof`` supplies externally computed out-of-fold predictions per model.
+        Pass it whenever the features are themselves fitted quantities - see
+        :func:`movierec.taste.training.train_ranker` - because internal
+        cross-validation cannot see that leakage and will report a score that is
+        far too optimistic.
+        """
         ranker = cls(feature_names=list(fm.names))
         n = fm.matrix.shape[0]
         heur = heuristic_scores(fm)
@@ -154,24 +190,42 @@ class TasteRanker:
                 random_state=17,
             )
 
-        folds = KFold(n_splits=min(5, max(3, n // 20)), shuffle=True, random_state=17)
         best_name, best_score, best_oof = "heuristic", _spearman(y, heur), heur
-        for name, model in candidates.items():
-            oof = np.zeros(n)
-            try:
-                for train_idx, test_idx in folds.split(X):
-                    import copy
 
-                    fold_model = copy.deepcopy(model)
-                    fold_model.fit(X[train_idx], y[train_idx])
-                    oof[test_idx] = fold_model.predict(X[test_idx])
-            except Exception as exc:
-                log.warning("cross-validation failed for %s: %s", name, exc)
-                continue
-            score = _spearman(y, oof)
-            log.info("cv %-9s spearman=%.3f", name, score)
-            if score > best_score:
-                best_name, best_score, best_oof = name, score, oof
+        if oof is not None:
+            # Prefer the held-out heuristic score as the baseline: comparing a
+            # learned model's out-of-fold score against an in-sample baseline
+            # would tilt the choice toward the learned model for free.
+            if "heuristic" in oof:
+                best_oof = np.asarray(oof["heuristic"], dtype=np.float64)
+                best_score = _spearman(y, best_oof)
+            for name, predictions in oof.items():
+                score = _spearman(y, np.asarray(predictions, dtype=np.float64))
+                log.info("held-out %-9s spearman=%.3f", name, score)
+                if name in candidates and score > best_score:
+                    best_name, best_score, best_oof = (
+                        name,
+                        score,
+                        np.asarray(predictions, dtype=np.float64),
+                    )
+        else:
+            folds = KFold(n_splits=min(5, max(3, n // 20)), shuffle=True, random_state=17)
+            for name, model in candidates.items():
+                fold_oof = np.zeros(n)
+                try:
+                    for train_idx, test_idx in folds.split(X):
+                        import copy
+
+                        fold_model = copy.deepcopy(model)
+                        fold_model.fit(X[train_idx], y[train_idx])
+                        fold_oof[test_idx] = fold_model.predict(X[test_idx])
+                except Exception as exc:
+                    log.warning("cross-validation failed for %s: %s", name, exc)
+                    continue
+                score = _spearman(y, fold_oof)
+                log.info("cv %-9s spearman=%.3f", name, score)
+                if score > best_score:
+                    best_name, best_score, best_oof = name, score, fold_oof
 
         ranker.metrics = RankerMetrics(
             n_train=n,
@@ -191,6 +245,13 @@ class TasteRanker:
             ranker._learned_mean = float(preds.mean())
             ranker._learned_std = float(preds.std()) or 1.0
             ranker.metrics.top_features = ranker._explain(model, X, y)
+        else:
+            # Nothing learned beat the prior, so report the prior's own weights
+            # rather than leaving the diagnostics blank.
+            ranker.metrics.top_features = sorted(
+                ((n, HEURISTIC_WEIGHTS.get(n, 0.0)) for n in fm.names),
+                key=lambda t: -abs(t[1]),
+            )[:10]
 
         # Trust the model in proportion to demonstrated skill.
         ranker.metrics.blend_weight = (

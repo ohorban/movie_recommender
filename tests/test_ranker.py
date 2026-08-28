@@ -104,3 +104,44 @@ def test_only_one_active_artifact(conn):
     assert active[0]["c"] == 1
     versions = fetch_all(conn, "SELECT COUNT(*) c FROM model_artifacts WHERE name='ranker'")
     assert versions[0]["c"] == 3, "old versions are kept for auditability"
+
+
+# --------------------------------------------------------------------------- #
+# Target leakage
+#
+# Every taste feature is derived from the ratings the model is trying to
+# predict. Without leave-one-out construction the model reads the label back
+# out of its own features and reports near-perfect accuracy while recommending
+# badly. These tests pin that down.
+# --------------------------------------------------------------------------- #
+def test_affinity_leaks_the_label_without_leave_one_out():
+    """A facet value seen exactly once is a pure function of that film's rating."""
+    from movierec.taste.profile import affinity_value, compute_affinity_stats
+
+    prefs = {1: 2.0, 2: -1.5, 3: 0.5}
+    facets = {i: {"director": [f"Director {i}"]} for i in prefs}  # each seen once
+    stats = compute_affinity_stats(prefs, facets)
+
+    leaked = [affinity_value(stats, "director", f"Director {i}") for i in prefs]
+    assert _spearman(np.array(list(prefs.values())), np.array(leaked)) == pytest.approx(1.0), (
+        "without LOO the affinity ranks the films exactly by their own rating"
+    )
+
+    clean = [
+        affinity_value(stats, "director", f"Director {i}", exclude_pref=p) for i, p in prefs.items()
+    ]
+    assert clean == [0.0, 0.0, 0.0], "with LOO a one-off facet carries no information"
+
+
+def test_leave_one_out_shrinks_a_shared_facet_correctly():
+    from movierec.taste.profile import affinity_value, compute_affinity_stats
+
+    prefs = {1: 2.0, 2: 0.0, 3: 1.0}
+    facets = {i: {"genre": ["Drama"]} for i in prefs}
+    stats = compute_affinity_stats(prefs, facets)
+
+    # Excluding film 1 leaves mean(0.0, 1.0) = 0.5, shrunk by 2 / (2 + k_genre).
+    expected = 0.5 * (2 / (2 + 4.0))
+    assert affinity_value(stats, "genre", "Drama", exclude_pref=2.0) == pytest.approx(expected)
+    # The full affinity is higher because film 1's own high rating is included.
+    assert affinity_value(stats, "genre", "Drama") > expected

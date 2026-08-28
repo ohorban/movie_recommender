@@ -1,0 +1,16 @@
+# Streamlit's source watcher imports every module in the process to look for
+# local files to hot-reload. `transformers` exposes hundreds of lazily-imported
+# submodules whose optional dependencies (torchvision) are not installed, so the
+# watcher prints a traceback for each one on every run. None of them matter, but
+# they bury the actual logs.
+#
+# Set this back to "auto" if you want hot-reload while editing app code; you
+# will get the noise back with it.
+[server]
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"

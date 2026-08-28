@@ -8,6 +8,7 @@ a one-time cost even when the rest of the pipeline is rebuilt.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 import threading
@@ -56,11 +57,44 @@ class ClaudeClient:
         self._cache_path = cache_path or str(cfg.cache_dir / "llm_cache.db")
         self._local = threading.local()
         self._lock = threading.Lock()
+        self._create_params = self._supported_create_params()
         self.calls = 0
         self.cache_hits = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self._init_cache()
+
+    def _supported_create_params(self) -> set[str]:
+        """Which keyword arguments this installed SDK's `messages.create` accepts.
+
+        The SDK is a moving target: anthropic 1.x dropped `temperature` and
+        `top_p` from Messages.create entirely. Rather than pin to one version,
+        introspect once and drop anything unsupported, so the same code runs on
+        0.x and 1.x alike.
+        """
+        try:
+            return set(inspect.signature(self.client.messages.create).parameters)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return set()
+
+    def _call_kwargs(self, **kwargs: Any) -> dict[str, Any]:
+        """Drop keyword arguments the installed SDK does not accept."""
+        if not self._create_params:
+            return kwargs
+        supported, dropped = {}, []
+        for key, value in kwargs.items():
+            if key in self._create_params:
+                supported[key] = value
+            else:
+                dropped.append(key)
+        if dropped and not getattr(self, "_warned_dropped", False):
+            log.info(
+                "anthropic %s does not accept %s; continuing without it",
+                getattr(self._anthropic, "__version__", "?"),
+                ", ".join(sorted(dropped)),
+            )
+            self._warned_dropped = True
+        return supported
 
     # ----------------------------------------------------------------- cache
     def _conn(self) -> sqlite3.Connection:

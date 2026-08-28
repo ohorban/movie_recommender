@@ -20,7 +20,7 @@ from ..db import blob_to_vector, fetch_all
 from ..enrich.embeddings import MOVIE, PLOT
 from ..enrich.structuring import DOSSIER_SCALES
 from ..logging_utils import get_logger
-from ..taste.profile import TasteProfile, load_movie_facets, runtime_bucket
+from ..taste.profile import TasteProfile, affinity_value, load_movie_facets, runtime_bucket
 
 log = get_logger("recommend.features")
 
@@ -117,6 +117,9 @@ class FeatureBuilder:
 
         # User's liked films drive the CF lookup.
         self._liked: dict[int, float] = {}
+        # Unnormalised centroid sums, needed to rebuild leave-one-out centroids.
+        self._mode_raw: list[np.ndarray] = []
+        self._dislike_raw: np.ndarray | None = None
 
     def set_reference_prefs(self, prefs: dict[int, float]) -> None:
         self._liked = {i: p for i, p in prefs.items() if p > 0.2}
@@ -161,6 +164,63 @@ class FeatureBuilder:
         peak = max(scores.values()) or 1.0
         return {k: math.tanh(2.0 * v / peak) for k, v in scores.items()}
 
+    def _prepare_loo(self, prefs: dict[int, float]) -> None:
+        """Rebuild the unnormalised centroid sums so a film can be removed from its own.
+
+        A taste centroid is a preference-weighted sum of the films in it. When
+        we score a film that is *itself* a member, its own vector is part of
+        what it is being compared against, which inflates the similarity. The
+        raw sums let us subtract that contribution one film at a time.
+        """
+        member_ids = sorted(
+            {i for m in self.profile.modes for i in m.member_ids}
+            | set(self.profile.dislike_member_ids)
+        )
+        if not member_ids:
+            return
+        vectors = self._vectors(member_ids, MOVIE)
+        if not vectors:
+            return
+        dim = next(iter(vectors.values())).shape[0]
+
+        self._mode_raw = []
+        for mode in self.profile.modes:
+            acc = np.zeros(dim, dtype=np.float64)
+            for member in mode.member_ids:
+                vec = vectors.get(int(member))
+                if vec is not None:
+                    acc += float(prefs.get(int(member), 0.0)) * vec
+            self._mode_raw.append(acc)
+
+        if self.profile.dislike_member_ids:
+            acc = np.zeros(dim, dtype=np.float64)
+            for member in self.profile.dislike_member_ids:
+                vec = vectors.get(int(member))
+                if vec is not None:
+                    acc += vec
+            self._dislike_raw = acc
+
+    def _loo_mode_matrix(self, tmdb_id: int, vec: np.ndarray, pref: float) -> np.ndarray:
+        """The mode centroids with this film's own contribution removed."""
+        if not self._mode_raw:
+            return self.mode_matrix
+        matrix = self.mode_matrix.copy()
+        for idx, mode in enumerate(self.profile.modes):
+            if tmdb_id not in mode.member_ids:
+                continue
+            adjusted = self._mode_raw[idx] - pref * vec
+            norm = float(np.linalg.norm(adjusted))
+            if norm > 1e-9:
+                matrix[idx] = (adjusted / norm).astype(np.float32)
+        return matrix
+
+    def _loo_dislike(self, tmdb_id: int, vec: np.ndarray) -> np.ndarray | None:
+        if self._dislike_raw is None or tmdb_id not in self.profile.dislike_member_ids:
+            return self.dislike
+        adjusted = self._dislike_raw - vec
+        norm = float(np.linalg.norm(adjusted))
+        return (adjusted / norm).astype(np.float32) if norm > 1e-9 else None
+
     def _quality(self, row: dict[str, Any]) -> float:
         tmdb_score, tmdb_votes = (
             row.get("tmdb_vote_average") or 0.0,
@@ -193,10 +253,30 @@ class FeatureBuilder:
             den += weight
         return float(num / den) if den > 0 else 0.0
 
+    def _aff(self, facet: str, value: str, loo_pref: float | None) -> float:
+        """Affinity for one facet value, optionally excluding one film's rating."""
+        if loo_pref is None or not self.profile.affinity_stats:
+            return self.profile.affinities.get(facet, {}).get(value, 0.0)
+        return affinity_value(self.profile.affinity_stats, facet, value, exclude_pref=loo_pref)
+
     # ------------------------------------------------------------------ main
     def build(
-        self, tmdb_ids: list[int], dossiers: dict[int, dict[str, Any]] | None = None
+        self,
+        tmdb_ids: list[int],
+        dossiers: dict[int, dict[str, Any]] | None = None,
+        loo_prefs: dict[int, float] | None = None,
     ) -> FeatureMatrix:
+        """Featurise a candidate set.
+
+        ``loo_prefs`` switches on leave-one-out construction for films that are
+        themselves part of the training set. Every taste signal here derives
+        from the user's ratings, so scoring a rated film against signals that
+        include its own rating leaks the target: a director seen exactly once
+        gets an affinity that is a direct function of that film's rating, and
+        the model "learns" to read the label back out of the feature. Pass the
+        training preferences and each film is scored against a profile built
+        without it.
+        """
         ids = [int(i) for i in tmdb_ids]
         if not ids:
             return FeatureMatrix(
@@ -208,6 +288,8 @@ class FeatureBuilder:
         plot_vecs = self._vectors(ids, PLOT)
         cf = self._cf_scores(ids)
         dossiers = dossiers or {}
+        if loo_prefs:
+            self._prepare_loo(loo_prefs)
 
         rows: dict[int, dict[str, Any]] = {}
         for start in range(0, len(ids), 900):
@@ -222,7 +304,6 @@ class FeatureBuilder:
             ):
                 rows[r["tmdb_id"]] = dict(r)
 
-        aff = self.profile.affinities
         out = np.zeros((len(ids), len(FEATURE_NAMES)), dtype=np.float32)
 
         for i, tmdb_id in enumerate(ids):
@@ -230,8 +311,13 @@ class FeatureBuilder:
             row = rows.get(tmdb_id, {})
             vec = movie_vecs.get(tmdb_id)
 
-            if vec is not None and self.mode_matrix.shape[0]:
-                sims = self.mode_matrix @ vec
+            loo_pref = loo_prefs.get(tmdb_id) if loo_prefs else None
+            modes = self.mode_matrix
+            if loo_pref is not None and vec is not None:
+                modes = self._loo_mode_matrix(tmdb_id, vec, loo_pref)
+
+            if vec is not None and modes.shape[0]:
+                sims = modes @ vec
                 sim_best = float(sims.max())
                 sim_weighted = float((sims * self.mode_weights).sum())
             else:
@@ -255,25 +341,23 @@ class FeatureBuilder:
                 "sim_plot_best": sim_plot,
                 "sim_dislike": sim_dislike,
                 "aff_genre": _mean_top(
-                    [aff.get("genre", {}).get(g, 0.0) for g in f.get("genre", [])], 3
+                    [self._aff("genre", g, loo_pref) for g in f.get("genre", [])], 3
                 ),
                 "aff_keyword": _mean_top(
-                    [aff.get("keyword", {}).get(k, 0.0) for k in f.get("keyword", [])], 6
+                    [self._aff("keyword", k, loo_pref) for k in f.get("keyword", [])], 6
                 ),
-                "aff_tag": _mean_top([aff.get("tag", {}).get(t, 0.0) for t in f.get("tag", [])], 6),
+                "aff_tag": _mean_top([self._aff("tag", t, loo_pref) for t in f.get("tag", [])], 6),
                 "aff_director": _mean_top(
-                    [aff.get("director", {}).get(d, 0.0) for d in f.get("director", [])], 1
+                    [self._aff("director", d, loo_pref) for d in f.get("director", [])], 1
                 ),
                 "aff_actor": _mean_top(
-                    [aff.get("actor", {}).get(a, 0.0) for a in f.get("actor", [])], 3
+                    [self._aff("actor", a, loo_pref) for a in f.get("actor", [])], 3
                 ),
-                "aff_decade": aff.get("decade", {}).get(
-                    f"{((row.get('year') or 0) // 10) * 10}s", 0.0
+                "aff_decade": self._aff(
+                    "decade", f"{((row.get('year') or 0) // 10) * 10}s", loo_pref
                 ),
-                "aff_language": aff.get("language", {}).get(
-                    row.get("original_language") or "", 0.0
-                ),
-                "aff_runtime": aff.get("runtime", {}).get(runtime_bucket(row.get("runtime")), 0.0),
+                "aff_language": self._aff("language", row.get("original_language") or "", loo_pref),
+                "aff_runtime": self._aff("runtime", runtime_bucket(row.get("runtime")), loo_pref),
                 "cf_score": cf.get(tmdb_id, 0.0),
                 "quality": self._quality(row),
                 "popularity": float(math.log1p(row.get("tmdb_popularity") or 0.0) / 6.0),

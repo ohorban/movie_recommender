@@ -86,7 +86,12 @@ class SentenceTransformerBackend(EmbeddingBackend):
         self.name = model_name
         self.batch_size = batch_size
         self.model = SentenceTransformer(model_name)
-        self.dim = int(self.model.get_sentence_embedding_dimension())
+        # Renamed in sentence-transformers 6; support both.
+        get_dim = (
+            getattr(self.model, "get_embedding_dimension", None)
+            or self.model.get_sentence_embedding_dimension
+        )
+        self.dim = int(get_dim())
         self._prefix = next(
             (p for k, p in self._QUERY_PREFIXES.items() if k in model_name.lower()), ""
         )

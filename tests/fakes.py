@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import threading
 from typing import Any
 
 GENRES = [
@@ -110,6 +111,7 @@ class FakeTMDBClient:
             self.by_year.setdefault(year, []).append(detail)
         self.search_calls = 0
         self.detail_calls = 0
+        self._lock = threading.Lock()
 
     # -- pipeline surface ---------------------------------------------------
     def configuration(self) -> dict[str, Any]:
@@ -153,19 +155,18 @@ class FakeTMDBClient:
         return self.details.get(int(tmdb_id))
 
     def search(self, title: str, year: int | None = None) -> list[dict[str, Any]]:
-        self.search_calls += 1
         want = title.lower().strip()
-        hits = []
-        for d in self.details.values():
-            if d["title"].lower() == want:
-                hits.append(d)
-        if not hits:
-            # Deterministically attach an id to any unknown title so resolution
-            # has something plausible to match, mimicking a real search.
-            tmdb_id = 900_000 + (abs(hash(want)) % 50_000)
-            if tmdb_id not in self.details:
-                self.details[tmdb_id] = make_movie(tmdb_id, year=year or 2015, title=title)
-            hits = [self.details[tmdb_id]]
+        with self._lock:
+            self.search_calls += 1
+            hits = [d for d in list(self.details.values()) if d["title"].lower() == want]
+            if not hits:
+                # Deterministically attach an id to any unknown title so
+                # resolution has something plausible to match, as a real
+                # search would.
+                tmdb_id = 900_000 + (abs(hash(want)) % 50_000)
+                if tmdb_id not in self.details:
+                    self.details[tmdb_id] = make_movie(tmdb_id, year=year or 2015, title=title)
+                hits = [self.details[tmdb_id]]
         return [
             {
                 "id": d["id"],
