@@ -91,6 +91,19 @@ class Config:
     db_path: Path = field(default_factory=lambda: Path("db/movierec.db"))
     data_dir: Path = field(default_factory=lambda: Path("data"))
 
+    def __post_init__(self) -> None:
+        """Anchor relative paths to ``root``.
+
+        :func:`load_config` already passes absolute paths, but a directly
+        constructed ``Config`` would otherwise resolve `db/` and `data/`
+        against the current working directory — quietly reading and writing
+        somebody else's files depending on where the process was started.
+        """
+        for field_name in ("db_path", "data_dir"):
+            value = getattr(self, field_name)
+            if not Path(value).is_absolute():
+                object.__setattr__(self, field_name, (self.root / value).resolve())
+
     # ---------------------------------------------------------------- paths
     @property
     def cache_dir(self) -> Path:

@@ -42,7 +42,9 @@ class LLMError(RuntimeError):
 class ClaudeClient:
     """Thin, thread-safe wrapper around the Anthropic Messages API."""
 
-    def __init__(self, cfg: Config, cache_path: str | None = None) -> None:
+    def __init__(self, cfg: Config, cache_path: str | None = None, *, client: Any = None) -> None:
+        """``client`` overrides the constructed SDK client; used by the tests to
+        drive a stand-in whose ``messages.create`` signature we control."""
         if not cfg.anthropic_api_key:
             raise LLMError("ANTHROPIC_API_KEY is not set. Add it to your .env file.")
         try:
@@ -53,7 +55,7 @@ class ClaudeClient:
         self.cfg = cfg
         self.model = cfg.llm_model
         self._anthropic = anthropic
-        self.client = anthropic.Anthropic(api_key=cfg.anthropic_api_key, max_retries=4)
+        self.client = client or anthropic.Anthropic(api_key=cfg.anthropic_api_key, max_retries=4)
         self._cache_path = cache_path or str(cfg.cache_dir / "llm_cache.db")
         self._local = threading.local()
         self._lock = threading.Lock()
@@ -73,9 +75,14 @@ class ClaudeClient:
         0.x and 1.x alike.
         """
         try:
-            return set(inspect.signature(self.client.messages.create).parameters)
+            signature = inspect.signature(self.client.messages.create)
         except (TypeError, ValueError):  # pragma: no cover - defensive
             return set()
+        # A `**kwargs` signature accepts anything, so there is nothing to
+        # filter against - and filtering against it would strip every argument.
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
+            return set()
+        return set(signature.parameters)
 
     def _call_kwargs(self, **kwargs: Any) -> dict[str, Any]:
         """Drop keyword arguments the installed SDK does not accept."""
@@ -151,15 +158,17 @@ class ClaudeClient:
 
         try:
             resp = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-                tools=[
-                    {"name": tool_name, "description": tool_description, "input_schema": schema}
-                ],
-                tool_choice={"type": "tool", "name": tool_name},
+                **self._call_kwargs(
+                    model=self.model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                    tools=[
+                        {"name": tool_name, "description": tool_description, "input_schema": schema}
+                    ],
+                    tool_choice={"type": "tool", "name": tool_name},
+                )
             )
         except Exception as exc:
             if "model" in str(exc).lower() and "not_found" in str(exc).lower():
@@ -237,11 +246,13 @@ class ClaudeClient:
                 self.cache_hits += 1
                 return cached.get("text", "")
         resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+            **self._call_kwargs(
+                model=self.model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
         )
         with self._lock:
             self.calls += 1

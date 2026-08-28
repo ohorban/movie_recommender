@@ -293,3 +293,8 @@ Tests that earned their keep during development, each of which caught a real bug
   ratings were cross-validated without rebuilding them per fold (see **Ranking** above).
 - `anthropic` 1.x removed `temperature` from `Messages.create`, so every LLM call raised. Keyword
   arguments are now filtered against the installed SDK's signature.
+- The *first* fix for that bug added the filter but never routed the call sites through it, and the
+  unit test checked the filter rather than the code path using it — so the test passed while
+  production stayed broken. `tests/test_llm.py` now drives the real methods against stand-in SDKs
+  and asserts at source level that no `messages.create` call bypasses the filter. A unit test of a
+  helper is not evidence that the helper is wired in.

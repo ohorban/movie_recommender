@@ -10,6 +10,28 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-08-28
+
+### Fixed
+
+- **The 0.1.2 fix for the `temperature` error never took effect.** The kwargs filter was added and
+  unit-tested, but neither `messages.create` call site was actually routed through it, so every LLM
+  call still raised exactly as before. The unit test passed because it exercised the filter in
+  isolation rather than the code path that uses it. Both call sites now use it, and
+  `tests/test_llm.py` drives `structured()` and `text()` end to end against stand-in SDKs with and
+  without `temperature` — plus a source-level assertion that no `messages.create` call bypasses the
+  filter.
+- A `**kwargs`-style `messages.create` signature (an SDK wrapper or decorator) made the filter strip
+  *every* argument. Filtering is now skipped when the callee accepts `VAR_KEYWORD`.
+- **`Config` resolved relative paths against the current working directory.** `load_config` always
+  passed absolute paths so production was unaffected, but a directly constructed `Config` would read
+  and write `data/` and `db/` wherever the process happened to start — which caused a test to write
+  into the maintainer's live cache. Relative paths are now anchored to `root`.
+
+### Added
+- `tests/test_llm.py` (12 tests): SDK-compatibility, caching, batch failure isolation, usage
+  accounting, and the call-site guard.
+
 ## [0.1.3] — 2026-08-28
 
 ### Fixed
@@ -151,7 +173,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/ohorban/movie_recommender/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ohorban/movie_recommender/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ohorban/movie_recommender/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ohorban/movie_recommender/compare/v0.1.0...v0.1.1
