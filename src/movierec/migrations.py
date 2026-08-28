@@ -342,3 +342,26 @@ CREATE TABLE kv (
 );
 """,
 )
+
+
+_add(
+    2,
+    "enrichment_attempts",
+    """
+-- Negative cache for enrichment lookups that legitimately found nothing.
+--
+-- Roughly one film in six has no confident Wikipedia article - a short, an
+-- obscure regional release, a title too generic to disambiguate. Without a
+-- record of that, those films stay in the "no plot yet" set forever and eat the
+-- fetch budget on every single update.
+CREATE TABLE enrichment_attempts (
+    tmdb_id      INTEGER NOT NULL REFERENCES movies(tmdb_id) ON DELETE CASCADE,
+    source       TEXT NOT NULL,       -- wikipedia_plot | ...
+    outcome      TEXT NOT NULL,       -- miss | error
+    attempts     INTEGER NOT NULL DEFAULT 1,
+    last_attempt TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (tmdb_id, source)
+);
+CREATE INDEX idx_enrichment_source ON enrichment_attempts(source, last_attempt);
+""",
+)

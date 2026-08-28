@@ -20,7 +20,7 @@ from typing import Any
 
 from rapidfuzz import fuzz
 
-from ..db import content_hash, fetch_all, transaction, upsert, utcnow
+from ..db import content_hash, fetch_all, scalar, transaction, upsert, utcnow
 from ..http_cache import CachedSession
 from ..logging_utils import get_logger
 from ..text_utils import clean_ws, normalize_title, truncate
@@ -122,23 +122,83 @@ def fetch_plot(session: CachedSession, title: str, year: int | None) -> tuple[st
     return plot, url
 
 
-def pending_plot_ids(conn: sqlite3.Connection, *, limit: int) -> list[int]:
-    """Films that should get a plot next: the user's own first, then the best of the catalog."""
-    rows = fetch_all(
-        conn,
-        """
-        SELECT m.tmdb_id
-        FROM movies m
-        LEFT JOIN movie_texts t ON t.tmdb_id = m.tmdb_id AND t.source = 'wikipedia_plot'
-        WHERE m.in_catalog = 1 AND m.detail_level = 2 AND t.tmdb_id IS NULL
-        ORDER BY
-            CASE WHEN EXISTS (SELECT 1 FROM user_films uf WHERE uf.tmdb_id = m.tmdb_id) THEN 0 ELSE 1 END,
-            COALESCE(m.tmdb_vote_count, 0) DESC
-        LIMIT ?
-        """,
-        (limit,),
+# How long before a film with no confident article is reconsidered. Matches the
+# HTTP cache TTL: retrying sooner just replays the same cached response.
+MISS_RETRY_DAYS = 180
+
+
+def plot_coverage(conn: sqlite3.Connection) -> int:
+    """How many catalog films already have a stored synopsis."""
+    return int(
+        scalar(conn, "SELECT COUNT(*) FROM movie_texts WHERE source = 'wikipedia_plot'", default=0)
     )
-    return [r["tmdb_id"] for r in rows]
+
+
+def pending_plot_ids(conn: sqlite3.Connection, *, target: int) -> list[int]:
+    """Films to fetch a synopsis for next.
+
+    ``target`` is a **coverage target**, not a per-run batch size: once this
+    many films have a synopsis, the catalog sweep stops. Treating it as a batch
+    size instead means every update fetches another full batch and slowly walks
+    the entire catalog, hours at a time, which is not what the setting says.
+
+    The user's own films are exempt from the budget - there are only a few
+    hundred of them and they are the ones that actually matter - so a newly
+    logged film always gets a synopsis even when the catalog target is met.
+    """
+    exhausted = (
+        "AND NOT EXISTS (SELECT 1 FROM enrichment_attempts a "
+        " WHERE a.tmdb_id = m.tmdb_id AND a.source = 'wikipedia_plot' "
+        f"   AND a.last_attempt >= datetime('now', '-{MISS_RETRY_DAYS} days'))"
+    )
+    base = (
+        "FROM movies m "
+        "LEFT JOIN movie_texts t ON t.tmdb_id = m.tmdb_id AND t.source = 'wikipedia_plot' "
+        "WHERE m.in_catalog = 1 AND m.detail_level = 2 AND t.tmdb_id IS NULL "
+        f"{exhausted}"
+    )
+
+    mine = [
+        r["tmdb_id"]
+        for r in fetch_all(
+            conn,
+            f"SELECT m.tmdb_id {base} AND EXISTS "
+            "(SELECT 1 FROM user_films uf WHERE uf.tmdb_id = m.tmdb_id) "
+            "ORDER BY COALESCE(m.tmdb_vote_count, 0) DESC",
+        )
+    ]
+
+    budget = max(0, int(target) - plot_coverage(conn))
+    catalog: list[int] = []
+    if budget:
+        catalog = [
+            r["tmdb_id"]
+            for r in fetch_all(
+                conn,
+                f"SELECT m.tmdb_id {base} AND NOT EXISTS "
+                "(SELECT 1 FROM user_films uf WHERE uf.tmdb_id = m.tmdb_id) "
+                "ORDER BY COALESCE(m.tmdb_vote_count, 0) DESC LIMIT ?",
+                (budget,),
+            )
+        ]
+
+    log.info(
+        "plots: %d stored, target %d -> %d of yours + %d from the catalog",
+        plot_coverage(conn),
+        target,
+        len(mine),
+        len(catalog),
+    )
+    return mine + catalog
+
+
+def record_miss(conn: sqlite3.Connection, tmdb_id: int, source: str = "wikipedia_plot") -> None:
+    conn.execute(
+        "INSERT INTO enrichment_attempts (tmdb_id, source, outcome, attempts, last_attempt) "
+        "VALUES (?, ?, 'miss', 1, ?) "
+        "ON CONFLICT (tmdb_id, source) DO UPDATE SET attempts = attempts + 1, last_attempt = excluded.last_attempt",
+        (int(tmdb_id), source, utcnow()),
+    )
 
 
 def fetch_plots(
@@ -176,9 +236,11 @@ def fetch_plots(
         for start in range(0, len(ids), batch_size):
             batch = ids[start : start + batch_size]
             rows = []
+            misses: list[int] = []
             for tmdb_id, result in pool.map(_one, batch):
                 if result is None:
                     missed += 1
+                    misses.append(tmdb_id)
                     continue
                 plot, url = result
                 rows.append(
@@ -193,9 +255,14 @@ def fetch_plots(
                     }
                 )
                 fetched += 1
-            if rows:
+            if rows or misses:
                 with transaction(conn):
-                    upsert(conn, "movie_texts", rows, key=["tmdb_id", "source"])
+                    if rows:
+                        upsert(conn, "movie_texts", rows, key=["tmdb_id", "source"])
+                    # Remember the misses so they do not consume the budget on
+                    # every future update.
+                    for tmdb_id in misses:
+                        record_miss(conn, tmdb_id)
             if progress:
                 frac = (start + len(batch)) / len(ids)
                 progress(

@@ -277,7 +277,7 @@ def _run_catalog_stages(conn, cfg, tmdb, session, runner, report, progress, kind
 
     if cfg.enable_wikipedia:
         with runner.stage("wikipedia") as stats:
-            todo = wiki_ingest.pending_plot_ids(conn, limit=cfg.wikipedia_limit)
+            todo = wiki_ingest.pending_plot_ids(conn, target=cfg.wikipedia_limit)
             progress(f"Fetching {len(todo):,} plot synopses", 0.73)
             try:
                 stats.update(

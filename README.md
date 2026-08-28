@@ -98,7 +98,7 @@ resumable — interrupt it and re-run, and it picks up where it stopped.
 | TMDB catalog discovery + detail | 20–30 min |
 | MovieLens 25M download + tag genome + CF | 15–25 min |
 | IMDb ratings | 2 min |
-| Wikipedia plot synopses (8k films) | 15–25 min |
+| Wikipedia plot synopses (8k films) | 40–70 min |
 | Embedding the catalog | 5–15 min |
 | Claude: reviews + film profiles | 3–6 min |
 
@@ -125,6 +125,10 @@ and an embedding is only recomputed when its source document changed. A typical 
 new logs takes seconds and costs a few cents.
 
 Old export folders can be left in `data/` — the newest is always used.
+
+`MOVIEREC_WIKIPEDIA_LIMIT` is a **coverage target**, not a per-run batch: once that many films have
+a synopsis the catalog sweep stops, so updates stay short. Raise it to deepen coverage (roughly
+4–8 minutes per additional 1,000 films, paid once). Your own films are always fetched regardless.
 
 ---
 

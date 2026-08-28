@@ -37,7 +37,7 @@ Ten stages, all incremental, all resumable:
 | 4 | `resolve` | Match user films to TMDB with confidence scores |
 | 5 | `imdb` | Attach IMDb ratings as a second quality opinion |
 | 6 | `movielens` | Tag genome + item-item collaborative filtering |
-| 7 | `wikipedia` | Plot synopses — the deep NL layer |
+| 7 | `wikipedia` | Plot synopses — the deep NL layer, to a coverage target |
 | 8 | `embeddings` | Profile and plot vectors; review vectors |
 | 9 | `review_structuring` + `dossiers` | Claude turns prose into structured data |
 | 10 | `taste_profile` + `ranker` | Fit and persist the model |

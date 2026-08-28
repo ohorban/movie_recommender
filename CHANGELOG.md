@@ -10,6 +10,24 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-08-28
+
+### Fixed
+
+- **`MOVIEREC_WIKIPEDIA_LIMIT` behaved as a per-run batch size rather than a coverage target**, so
+  every update fetched another full batch of synopses — hours at a time — slowly walking the entire
+  30k catalog rather than stopping once the target was met. The budget is now the remaining
+  shortfall (`target - already_stored`). On the maintainer's database this took the next update from
+  8,000 fetches to 1,417.
+- Films with no confident Wikipedia article (about one in six) were never recorded as such, so they
+  stayed in the "no synopsis yet" set forever and consumed the budget on every run. Added an
+  `enrichment_attempts` negative cache (migration 002), with a 180-day retry window matching the
+  HTTP cache TTL.
+
+### Changed
+- The user's own films are now exempt from the coverage budget — a newly logged film always gets a
+  synopsis even once the catalog target is met — and are still fetched first.
+
 ## [0.1.2] — 2026-08-28
 
 ### Fixed
@@ -133,7 +151,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/ohorban/movie_recommender/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ohorban/movie_recommender/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ohorban/movie_recommender/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ohorban/movie_recommender/releases/tag/v0.1.0
