@@ -203,7 +203,8 @@ make doctor      # environment, keys and database health
 ```
 
 Python 3.12 by default; override with `make dev-install PYTHON_VERSION=3.11`. CI runs the suite on
-3.10, 3.12 and 3.13.
+3.12 — the version this actually runs on. 3.10 and 3.13 are verified by hand when the dependency
+floor moves; a permanent version matrix is ceremony for a single-user app.
 
 The end-to-end tests need a Letterboxd export. `data/` is git-ignored, so on a clean checkout the
 fixture generates a realistic one instead — otherwise the whole pipeline suite would skip silently

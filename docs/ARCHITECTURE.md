@@ -273,7 +273,7 @@ Every external dependency degrades rather than breaks:
 
 ## Testing
 
-177 tests, no network required, on Python 3.10 / 3.12 / 3.13.
+177 tests, no network required. CI runs them on 3.12; 3.10 and 3.13 are verified by hand.
 
 The end-to-end suite needs a Letterboxd export, and `data/` is git-ignored. For a long time that
 meant every one of those tests skipped on a clean checkout — CI was green while testing barely half

@@ -10,6 +10,23 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-28
+
+### Fixed
+- **CI could not install anything.** `uv pip install --system` assumes a system interpreter, but
+  `setup-uv` provisions a *managed* Python — so 3.10 and 3.13 reported "No system Python
+  installation found", and 3.12 fell through to Debian's externally-managed interpreter and was
+  refused. The job now uses `activate-environment: true`, which puts uv's managed Python on PATH in
+  a virtual environment, and installs without `--system`.
+
+### Changed
+- **Dropped the Python version matrix.** CI runs on 3.12 alone — the version the Makefile creates
+  and the version this is actually run on. For a single-user application a three-version matrix
+  triples CI time and offers three ways to fail on something that cannot affect the only user.
+  `requires-python` stays at `>=3.10`; 3.10 and 3.13 were verified by hand and remain supported,
+  they are just not re-checked on every push. Restoring the matrix is a four-line change if the
+  project ever grows a second user.
+
 ## [0.1.6] — 2026-08-28
 
 ### Fixed
@@ -224,7 +241,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/ohorban/movie_recommender/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/ohorban/movie_recommender/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ohorban/movie_recommender/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ohorban/movie_recommender/compare/v0.1.3...v0.1.4
