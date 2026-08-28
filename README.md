@@ -199,7 +199,7 @@ make update           # incremental update
 make app              # web interface
 make doctor           # check keys, install, and database health
 make rebuild          # wipe and rebuild (keeps your manual film matches)
-make test             # 177 tests, no network needed
+make test             # 187 tests, no network needed
 ```
 
 The `movierec` command does the same and a bit more:

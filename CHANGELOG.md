@@ -10,6 +10,31 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-28
+
+### Fixed
+- **Clicking an example query in the Ask tab crashed the app.** Streamlit forbids assigning to
+  `st.session_state[key]` once the widget owning that key exists, and the chips did exactly that to
+  prefill the search box. They now use an `on_click` callback, which runs before the rerun and is
+  the supported way to do it.
+- The CI guard step piped `pytest` into `tee`, so the pipe's exit code masked pytest's. The step
+  passed even when the tests failed — and even when `pytest` was not installed at all. It now runs
+  under `shell: bash`, which sets `-eo pipefail`.
+
+### Added
+- `tests/test_app.py` (10 tests) drives the interface through Streamlit's `AppTest`: example chips,
+  reroll, thumbs-down writing feedback, tab contents, and a check that rendering never fires the
+  destructive update button.
+- `test_every_button_survives_a_click` presses **every** button on every tab, one per fresh run, and
+  fails on any exception. That is the general guard for this class of bug. Verified to have teeth:
+  reverting the chip fix fails three tests, including this one.
+- CI installs the `app` extra and fails if either the end-to-end or UI suite skips itself.
+
+### Note
+The previous UI checks only called `AppTest.run()` — they rendered the app and asserted it looked
+right. This bug raises only on click, so those checks reported a healthy app while a whole tab was
+broken. Rendering is not exercising.
+
 ## [0.1.8] — 2026-08-28
 
 ### Changed
@@ -262,7 +287,8 @@ First working version: the whole pipeline from Letterboxd export to ranked recom
 - With ~150 ratings the learned ranker is genuinely small-data; the blend weight reflects this.
 - The catalog grows slowly across updates as new releases are added, beyond the configured size.
 
-[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/ohorban/movie_recommender/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/ohorban/movie_recommender/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/ohorban/movie_recommender/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/ohorban/movie_recommender/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/ohorban/movie_recommender/compare/v0.1.5...v0.1.6

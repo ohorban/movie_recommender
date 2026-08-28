@@ -34,11 +34,11 @@ jobs:
           # one, finds nothing, and fails the job.
           cache-dependency-glob: "pyproject.toml"
 
-      # The `embed` and `app` extras are deliberately excluded: the suite runs
-      # on the offline hash backend, so CI needs no model download and no
-      # network access at all.
+      # `app` is needed because the UI tests drive Streamlit. `embed` stays
+      # out: the suite runs on the offline hash backend, so CI needs no model
+      # download and no network access at all.
       - name: Install
-        run: uv pip install -e ".[dev]"
+        run: uv pip install -e ".[app,dev]"
 
       - name: Lint
         run: |
@@ -53,11 +53,19 @@ jobs:
       # `data/` is git-ignored — so they used to skip silently on a clean
       # checkout and CI passed on barely half the suite. conftest now generates
       # an export when none is present; this makes sure that keeps working.
-      - name: Fail if the pipeline tests silently skipped
+      # A test that silently does not run is worse than no test: it also
+      # removes the pressure to write one. The end-to-end tests need a
+      # Letterboxd export (git-ignored, so conftest generates one) and the UI
+      # tests need Streamlit installed. Both used to skip themselves quietly.
+      - name: Fail if any suite silently skipped
+        # `shell: bash` gets `-eo pipefail`. Without it the pipe into tee
+        # swallows pytest's exit code and the step passes even when the tests
+        # fail — or when pytest is not installed at all.
+        shell: bash
         run: |
-          pytest tests/test_pipeline_e2e.py -rs --no-header | tee /tmp/e2e.txt
-          if grep -q "no Letterboxd export" /tmp/e2e.txt; then
-            echo "::error::end-to-end tests skipped for want of an export fixture"
+          pytest tests/test_pipeline_e2e.py tests/test_app.py -rs --no-header | tee /tmp/guard.txt
+          if grep -qE "no Letterboxd export|app extra is not installed" /tmp/guard.txt; then
+            echo "::error::a test suite skipped itself instead of running"
             exit 1
           fi
 
