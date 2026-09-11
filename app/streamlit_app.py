@@ -168,6 +168,16 @@ def render_rec(item, *, hero: bool = False, key_prefix: str = "") -> None:
                 st.caption(item.dossier.get("who_its_for", ""))
 
 
+def _use_example(text: str) -> None:
+    """Prefill the Ask box from an example chip.
+
+    Must be an `on_click` callback: assigning to `st.session_state["ask_query"]`
+    inline raises StreamlitAPIException, because the text_input owning that key
+    has already been instantiated by then.
+    """
+    st.session_state["ask_query"] = text
+
+
 def not_ready(message: str) -> None:
     st.warning(message)
     st.markdown(
@@ -297,9 +307,16 @@ with tab_ask:
 
             chips = st.columns(len(EXAMPLES))
             for col, example in zip(chips, EXAMPLES):
-                if col.button(example, key=f"ex_{example[:14]}", width="stretch"):
-                    st.session_state["ask_query"] = example
-                    query = example
+                # Streamlit forbids writing session_state for a widget key after
+                # that widget has been created. A callback runs before the next
+                # rerun, which is the supported way to prefill the box.
+                col.button(
+                    example,
+                    key=f"ex_{example[:14]}",
+                    width="stretch",
+                    on_click=_use_example,
+                    args=(example,),
+                )
 
             c1, c2, c3 = st.columns([1, 1, 2])
             n = c1.slider("How many", 3, 12, 6)

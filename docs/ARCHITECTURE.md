@@ -273,7 +273,11 @@ Every external dependency degrades rather than breaks:
 
 ## Testing
 
-177 tests, no network required. CI runs them on 3.12; 3.10 and 3.13 are verified by hand.
+187 tests, no network required. CI runs them on 3.12; 3.10 and 3.13 are verified by hand.
+
+The UI is driven through Streamlit's `AppTest`, and the tests press buttons rather than only
+rendering. A render-only check reported a healthy app while every example chip in the Ask tab
+raised on click.
 
 The end-to-end suite needs a Letterboxd export, and `data/` is git-ignored. For a long time that
 meant every one of those tests skipped on a clean checkout — CI was green while testing barely half
