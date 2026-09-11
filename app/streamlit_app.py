@@ -11,6 +11,7 @@ Run with:  streamlit run app/streamlit_app.py
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -19,6 +20,8 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
+
+from streamlit.errors import NoSessionContext  # noqa: E402
 
 from movierec import __version__  # noqa: E402
 from movierec.config import load_config  # noqa: E402
@@ -552,7 +555,8 @@ with tab_data:
     st.markdown("### Update from a new Letterboxd export")
     st.caption(
         f"Drop the unzipped export folder into `{cfg.data_dir.name}/` — the newest one wins. "
-        "Only what actually changed gets reprocessed, so updates are quick and cheap."
+        "Only what actually changed gets reprocessed, so updates are quick and cheap. "
+        "Leave this tab alone while it runs — clicking elsewhere restarts it."
     )
 
     export = latest_export_dir(cfg.data_dir)
@@ -579,7 +583,12 @@ with tab_data:
         log_box = st.empty()
 
         def on_progress(message: str, fraction: float) -> None:
-            bar.progress(min(1.0, max(0.0, fraction)), text=message)
+            # Progress is cosmetic; it must never abort a long pipeline. Only
+            # NoSessionContext is suppressed. Streamlit cancels a running script
+            # by raising StopException / RerunException through st.* calls, so
+            # swallowing those would leave the old run alive beside the new one.
+            with contextlib.suppress(NoSessionContext):
+                bar.progress(min(1.0, max(0.0, fraction)), text=message)
 
         try:
             report = run_pipeline(

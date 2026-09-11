@@ -206,28 +206,39 @@ class ClaudeClient:
         progress_span: tuple[float, float] = (0.0, 1.0),
         label: str = "Thinking",
     ) -> list[dict[str, Any] | None]:
-        """Run many `structured` calls concurrently, preserving input order."""
+        """Run many `structured` calls concurrently, preserving input order.
+
+        Progress is reported from the **calling** thread, never from a worker.
+        That is not a style choice: the Streamlit UI passes a callback that
+        writes to a progress widget, and Streamlit raises `NoSessionContext`
+        when a widget is touched off the main thread — which killed the whole
+        update run. Consuming `pool.map` lazily here keeps the callback on the
+        caller's thread while the work still happens concurrently.
+
+        It also restores cancellation. The main thread previously blocked
+        inside `list(pool.map(...))` with no callback of its own, so Streamlit
+        had no point at which to interrupt a long run, and a second click
+        started a second pipeline alongside the first.
+        """
         if not jobs:
             return []
         lo, hi = progress_span
-        done = 0
-        lock = threading.Lock()
+        total = len(jobs)
 
         def run(job: dict[str, Any]) -> dict[str, Any] | None:
-            nonlocal done
             try:
                 return self.structured(**job)
             except Exception as exc:
                 log.warning("LLM call failed (%s): %s", job.get("kind"), exc)
                 return None
-            finally:
-                with lock:
-                    done += 1
-                    if progress and done % 5 == 0:
-                        progress(f"{label} · {done}/{len(jobs)}", lo + (hi - lo) * done / len(jobs))
 
+        results: list[dict[str, Any] | None] = []
         with ThreadPoolExecutor(max_workers=max(1, self.cfg.llm_max_concurrency)) as pool:
-            return list(pool.map(run, jobs))
+            for done, result in enumerate(pool.map(run, jobs), start=1):
+                results.append(result)
+                if progress and (done % 5 == 0 or done == total):
+                    progress(f"{label} · {done}/{total}", lo + (hi - lo) * done / total)
+        return results
 
     def text(
         self,

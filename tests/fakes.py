@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 GENRES = [
@@ -310,7 +311,22 @@ class FakeClaudeClient:
         return {}
 
     def map_structured(self, jobs, *, progress=None, progress_span=(0.0, 1.0), label="") -> list:
-        return [self.structured(**job) for job in jobs]
+        """Mirrors the real client: concurrent work, progress on the caller's thread.
+
+        Running these serially would hide exactly the bug that broke the
+        Streamlit update button.
+        """
+        if not jobs:
+            return []
+        lo, hi = progress_span
+        total = len(jobs)
+        results = []
+        with ThreadPoolExecutor(max_workers=max(1, self.cfg.llm_max_concurrency)) as pool:
+            for done, result in enumerate(pool.map(lambda j: self.structured(**j), jobs), start=1):
+                results.append(result)
+                if progress and (done % 5 == 0 or done == total):
+                    progress(f"{label} · {done}/{total}", lo + (hi - lo) * done / total)
+        return results
 
     def text(self, *, system: str, user: str, **_kw) -> str:
         return "A plausible sentence."

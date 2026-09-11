@@ -236,3 +236,81 @@ def test_config_leaves_absolute_paths_alone(tmp_path):
     elsewhere = tmp_path / "elsewhere"
     cfg = Config(root=tmp_path, data_dir=elsewhere)
     assert cfg.data_dir == elsewhere
+
+
+# --------------------------------------------------------------------------- #
+# Threading contract
+#
+# The Streamlit UI passes a callback that writes to a progress widget, and
+# Streamlit raises NoSessionContext when a widget is touched off the main
+# thread. map_structured used to report progress from inside its worker
+# threads, which killed the whole update run partway through.
+# --------------------------------------------------------------------------- #
+def test_progress_is_reported_from_the_calling_thread(tmp_path):
+    import threading
+
+    client = make_client(tmp_path, ModernMessages())
+    assert client.cfg.llm_max_concurrency > 1, "the test is meaningless without a pool"
+
+    caller = threading.get_ident()
+    reported: list[int] = []
+    jobs = [
+        {
+            "kind": "test",
+            "system": "s",
+            "user": f"job {i}",
+            "schema": SCHEMA,
+            "tool_name": "record",
+            "tool_description": "d",
+            "use_cache": False,
+        }
+        for i in range(20)
+    ]
+    client.map_structured(jobs, progress=lambda _m, _f: reported.append(threading.get_ident()))
+
+    assert reported, "progress should have been reported at least once"
+    assert set(reported) == {caller}, (
+        "progress must run on the caller's thread; Streamlit widgets cannot be "
+        "touched from a worker"
+    )
+
+
+def test_map_structured_preserves_order_under_concurrency(tmp_path):
+    client = make_client(tmp_path, ModernMessages())
+    jobs = [
+        {
+            "kind": "test",
+            "system": "s",
+            "user": f"job {i}",
+            "schema": SCHEMA,
+            "tool_name": "record",
+            "tool_description": "d",
+            "use_cache": False,
+        }
+        for i in range(15)
+    ]
+    out = client.map_structured(jobs)
+    assert len(out) == len(jobs)
+    assert all(r is not None for r in out)
+
+
+def test_progress_reaches_the_end_of_its_span(tmp_path):
+    client = make_client(tmp_path, ModernMessages())
+    fractions: list[float] = []
+    jobs = [
+        {
+            "kind": "test",
+            "system": "s",
+            "user": f"job {i}",
+            "schema": SCHEMA,
+            "tool_name": "record",
+            "tool_description": "d",
+            "use_cache": False,
+        }
+        for i in range(7)  # not a multiple of the reporting interval
+    ]
+    client.map_structured(
+        jobs, progress=lambda _m, f: fractions.append(f), progress_span=(0.2, 0.6)
+    )
+    assert fractions[-1] == pytest.approx(0.6), "the final item should close the span"
+    assert all(0.2 <= f <= 0.6 for f in fractions)
