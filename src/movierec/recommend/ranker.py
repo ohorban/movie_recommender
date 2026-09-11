@@ -42,6 +42,11 @@ class RankerMetrics:
     ndcg_at_10: float = 0.0
     model_kind: str = "heuristic"
     blend_weight: float = 0.0
+    # Spread of the held-out score across repeated fold splits. On ~160 ratings
+    # a single split swings by roughly 0.07, so the headline figure means
+    # little without it.
+    spearman_sd: float = 0.0
+    cv_repeats: int = 1
     top_features: list[tuple[str, float]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
@@ -52,6 +57,8 @@ class RankerMetrics:
             "ndcg_at_10": round(self.ndcg_at_10, 4),
             "model_kind": self.model_kind,
             "blend_weight": round(self.blend_weight, 4),
+            "spearman_sd": round(self.spearman_sd, 4),
+            "cv_repeats": self.cv_repeats,
             "top_features": [(n, round(v, 4)) for n, v in self.top_features],
         }
 
@@ -150,6 +157,7 @@ class TasteRanker:
         targets: np.ndarray,
         *,
         oof: dict[str, np.ndarray] | None = None,
+        oof_scores: dict[str, dict[str, float]] | None = None,
     ) -> TasteRanker:
         """Fit the ranker.
 
@@ -192,7 +200,33 @@ class TasteRanker:
 
         best_name, best_score, best_oof = "heuristic", _spearman(y, heur), heur
 
-        if oof is not None:
+        if oof_scores:
+            # Repeated cross-validation: each entry is already the mean of the
+            # per-split metrics. Averaging the *metrics* estimates the model we
+            # actually deploy; averaging the predictions instead would measure
+            # an ensemble of fold models and read several points too high —
+            # enough, on this data, to pick a learned model that does not in
+            # fact beat the prior.
+            eligible = {n: v for n, v in oof_scores.items() if n == "heuristic" or n in candidates}
+            best_name = max(eligible, key=lambda n: eligible[n]["spearman"])
+            chosen = eligible[best_name]
+            for name, value in sorted(eligible.items(), key=lambda t: -t[1]["spearman"]):
+                log.info(
+                    "held-out %-9s spearman=%.3f (sd %.3f)",
+                    name,
+                    value["spearman"],
+                    value.get("sd", 0.0),
+                )
+            ranker.metrics = RankerMetrics(
+                n_train=n,
+                spearman=chosen["spearman"],
+                mae=chosen.get("mae", 0.0),
+                ndcg_at_10=chosen.get("ndcg_at_10", 0.0),
+                model_kind=best_name,
+                spearman_sd=chosen.get("sd", 0.0),
+                cv_repeats=int(chosen.get("repeats", 1)),
+            )
+        elif oof is not None:
             # Prefer the held-out heuristic score as the baseline: comparing a
             # learned model's out-of-fold score against an in-sample baseline
             # would tilt the choice toward the learned model for free.
@@ -227,15 +261,17 @@ class TasteRanker:
                 if score > best_score:
                     best_name, best_score, best_oof = name, score, fold_oof
 
-        ranker.metrics = RankerMetrics(
-            n_train=n,
-            spearman=best_score,
-            mae=float(np.abs(y - best_oof).mean())
-            if best_name != "heuristic"
-            else float(np.abs(y - y.mean()).mean()),
-            ndcg_at_10=_ndcg_at_k(y, best_oof, 10),
-            model_kind=best_name,
-        )
+        if not oof_scores:
+            ranker.metrics = RankerMetrics(
+                n_train=n,
+                spearman=best_score,
+                mae=float(np.abs(y - best_oof).mean())
+                if best_name != "heuristic"
+                else float(np.abs(y - y.mean()).mean()),
+                ndcg_at_10=_ndcg_at_k(y, best_oof, 10),
+                model_kind=best_name,
+            )
+        best_score = ranker.metrics.spearman
 
         if best_name != "heuristic":
             model = candidates[best_name]
@@ -367,6 +403,8 @@ class TasteRanker:
             mae=metrics_raw.get("mae", 0.0),
             ndcg_at_10=metrics_raw.get("ndcg_at_10", 0.0),
             model_kind=metrics_raw.get("model_kind", "heuristic"),
+            spearman_sd=metrics_raw.get("spearman_sd", 0.0),
+            cv_repeats=metrics_raw.get("cv_repeats", 1),
             blend_weight=metrics_raw.get("blend_weight", 0.0) if ranker._model is not None else 0.0,
             top_features=[tuple(t) for t in metrics_raw.get("top_features", [])],
         )

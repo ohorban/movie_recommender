@@ -11,7 +11,13 @@ from ..enrich.embeddings import EmbeddingBackend
 from ..enrich.structuring import load_dossiers
 from ..logging_utils import get_logger
 from ..recommend.features import FeatureBuilder
-from ..recommend.ranker import MIN_TRAINING_ROWS, TasteRanker, heuristic_scores
+from ..recommend.ranker import (
+    MIN_TRAINING_ROWS,
+    TasteRanker,
+    _ndcg_at_k,
+    _spearman,
+    heuristic_scores,
+)
 from .profile import (
     TasteProfile,
     build_profile_from_prefs,
@@ -20,6 +26,10 @@ from .profile import (
 )
 
 log = get_logger("taste.training")
+
+# Fold splits used for the held-out estimate. Each is cheap (well under a
+# second); five of them turn a figure that bounces by 0.07 into a stable one.
+CV_SEEDS = (17, 23, 42, 99, 7)
 
 
 def _fold_predictions(
@@ -121,17 +131,41 @@ def train_ranker(
     ids = list(prefs.keys())
     targets = np.array([prefs[i] for i in ids], dtype=np.float64)
 
-    oof = None
+    oof_scores: dict[str, dict[str, float]] | None = None
     if len(prefs) >= MIN_TRAINING_ROWS:
         try:
-            oof = _fold_predictions(conn, backend, prefs, titles)
-            # _fold_predictions works on sorted ids; realign to `ids` order.
-            order = {int(i): k for k, i in enumerate(sorted(prefs.keys()))}
-            index = np.array([order[i] for i in ids])
-            oof = {name: values[index] for name, values in oof.items()}
+            # Repeated k-fold. A single split of ~160 ratings produces a score
+            # that swings by about 0.07 run to run on identical data, which
+            # reads as a regression when nothing has changed. Each split is
+            # scored on its own and the metrics are averaged — not the
+            # predictions, which would measure an ensemble of fold models
+            # rather than the single model actually deployed.
+            sorted_ids = sorted(prefs.keys())
+            y_sorted = np.array([prefs[int(i)] for i in sorted_ids])
+            per_split: dict[str, list[tuple[float, float, float]]] = {}
+            for seed in CV_SEEDS:
+                run = _fold_predictions(conn, backend, prefs, titles, seed=seed)
+                for name, predictions in run.items():
+                    per_split.setdefault(name, []).append(
+                        (
+                            _spearman(y_sorted, predictions),
+                            _ndcg_at_k(y_sorted, predictions, 10),
+                            float(np.abs(y_sorted - predictions).mean()),
+                        )
+                    )
+            oof_scores = {
+                name: {
+                    "spearman": float(np.mean([v[0] for v in vals])),
+                    "sd": float(np.std([v[0] for v in vals])),
+                    "ndcg_at_10": float(np.mean([v[1] for v in vals])),
+                    "mae": float(np.mean([v[2] for v in vals])),
+                    "repeats": len(vals),
+                }
+                for name, vals in per_split.items()
+            }
         except Exception as exc:
             log.warning("held-out evaluation failed (%s); falling back to in-sample CV", exc)
-            oof = None
+            oof_scores = None
 
     builder = FeatureBuilder(conn, profile, embed_model=backend.name)
     builder.set_reference_prefs(prefs)
@@ -143,7 +177,7 @@ def train_ranker(
     for row, tmdb_id in enumerate(fm.ids):
         fm.matrix[row, cf_idx] = max(0.0, float(fm.matrix[row, cf_idx]) - self_cf.get(tmdb_id, 0.0))
 
-    ranker = TasteRanker.fit(fm, targets, oof=oof)
+    ranker = TasteRanker.fit(fm, targets, oof_scores=oof_scores)
     if store:
         ranker.save(conn)
     return ranker

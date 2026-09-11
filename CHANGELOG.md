@@ -24,13 +24,35 @@ manual migration step*, and is always called out explicitly.
   one error: Streamlit cancels a running script by raising `StopException` / `RerunException`
   through `st.*` calls, so swallowing those would leave an old run alive beside a new one.
 
+### Changed
+- **The reported ranker accuracy is now an average over five fold splits instead of one.** With 163
+  rated films, which films land in which fold moves the held-out Spearman by more than any change
+  made to the model: measured on unchanged data and an unchanged model, it ranged 0.445–0.514
+  (sd 0.023). A single split was therefore reporting mostly noise, and a run-to-run move was easy to
+  mistake for a real gain or regression. Training now repeats the cross-validation with five seeds
+  and reports the mean with its spread.
+- Model selection uses those averaged scores too, so which ranker gets deployed no longer depends on
+  one lucky split.
+- The Insights tab shows the accuracy as `mean ± sd`. Read the spread first: a difference smaller
+  than it is not a difference.
+
 ### Added
+- `RankerMetrics` carries `spearman_sd` and `cv_repeats`, both persisted with the model.
+- Four tests cover the averaged-score path: that the averages (not a single split) drive selection,
+  that a learned model still wins when it earns it, that an untrained model is never selected, and
+  that the spread survives a save and reload.
 - `test_progress_is_reported_from_the_calling_thread` drives the real `ClaudeClient` and pins the
   contract; two further tests cover ordering under concurrency and that progress closes its span.
 - `test_progress_is_never_reported_from_a_worker_thread` runs the whole pipeline with a callback
   that fails on any off-thread call, covering TMDB, Wikipedia and resolution.
 - The test LLM client now runs its calls through a thread pool like the real one. Running them
   serially is what hid this bug.
+
+### Note
+The first version of the averaging above averaged the *predictions* across the five splits and
+scored those. That measures a five-model ensemble, not the single model that actually gets deployed,
+and it flattered the ridge model into winning. Averaging the *metrics* is the correct form: each
+split scores the model as it will be used, and the five scores are then summarised.
 
 
 ## [0.1.9] — 2026-08-28

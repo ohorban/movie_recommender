@@ -145,3 +145,61 @@ def test_leave_one_out_shrinks_a_shared_facet_correctly():
     assert affinity_value(stats, "genre", "Drama", exclude_pref=2.0) == pytest.approx(expected)
     # The full affinity is higher because film 1's own high rating is included.
     assert affinity_value(stats, "genre", "Drama") > expected
+
+
+# --------------------------------------------------------------------------- #
+# Repeated cross-validation
+#
+# A single fold split of ~160 ratings gives a score that moves by about 0.07
+# run to run on identical data. The fix is to repeat the split and average —
+# but average the *metrics*, not the predictions. Averaging predictions scores
+# an ensemble of fold models rather than the single model deployed, which on
+# real data read high enough to pick a learned model that loses to the prior.
+# --------------------------------------------------------------------------- #
+def test_averaged_scores_drive_model_selection():
+    fm, y = make_fm(160)
+    scores = {
+        "heuristic": {"spearman": 0.52, "sd": 0.02, "ndcg_at_10": 0.80, "mae": 0.7, "repeats": 5},
+        "ridge": {"spearman": 0.48, "sd": 0.02, "ndcg_at_10": 0.77, "mae": 0.7, "repeats": 5},
+    }
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores)
+    assert ranker.metrics.model_kind == "heuristic", "the prior won on held-out data"
+    assert ranker.metrics.spearman == pytest.approx(0.52)
+    assert ranker.metrics.spearman_sd == pytest.approx(0.02)
+    assert ranker.metrics.cv_repeats == 5
+    assert ranker.metrics.blend_weight == 0.0, "a losing learned model must be ignored"
+
+
+def test_a_learned_model_that_wins_is_used():
+    fm, y = make_fm(160)
+    scores = {
+        "heuristic": {"spearman": 0.20, "sd": 0.03, "ndcg_at_10": 0.60, "mae": 0.9, "repeats": 5},
+        "ridge": {"spearman": 0.46, "sd": 0.02, "ndcg_at_10": 0.78, "mae": 0.7, "repeats": 5},
+    }
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores)
+    assert ranker.metrics.model_kind == "ridge"
+    assert ranker.metrics.blend_weight > 0.9
+    assert ranker.metrics.top_features, "a fitted model should explain itself"
+
+
+def test_unavailable_models_are_not_selected():
+    """gbdt needs 80+ rows; a score for it must not win below that."""
+    fm, y = make_fm(40)
+    scores = {
+        "heuristic": {"spearman": 0.30, "sd": 0.02, "ndcg_at_10": 0.7, "mae": 0.8, "repeats": 5},
+        "gbdt": {"spearman": 0.90, "sd": 0.01, "ndcg_at_10": 0.95, "mae": 0.3, "repeats": 5},
+    }
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores)
+    assert ranker.metrics.model_kind != "gbdt"
+
+
+def test_the_spread_survives_a_save_and_load(conn):
+    fm, y = make_fm(160)
+    scores = {
+        "heuristic": {"spearman": 0.5, "sd": 0.031, "ndcg_at_10": 0.8, "mae": 0.7, "repeats": 5}
+    }
+    TasteRanker.fit(fm, y, oof_scores=scores).save(conn)
+    restored = TasteRanker.load(conn)
+    assert restored is not None
+    assert restored.metrics.spearman_sd == pytest.approx(0.031)
+    assert restored.metrics.cv_repeats == 5

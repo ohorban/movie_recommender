@@ -494,9 +494,15 @@ with tab_insights:
                 cols[0].metric("Model", m.model_kind)
                 cols[1].metric(
                     "Rank correlation",
-                    f"{m.spearman:.3f}",
-                    help="Cross-validated Spearman between predicted and actual preference. "
-                    "Above 0.3 is genuinely useful at this data size.",
+                    f"{m.spearman:.2f}" + (f" ± {m.spearman_sd:.2f}" if m.spearman_sd else ""),
+                    help=(
+                        "Held-out Spearman between predicted and actual preference, averaged over "
+                        f"{m.cv_repeats} fold splits. The taste profile is rebuilt inside each "
+                        "fold, so a film being scored never helped build the signals scoring it. "
+                        "The ± is how far the figure moves between splits on identical data — "
+                        "treat any change smaller than that as noise. Above 0.3 is genuinely "
+                        "useful at this data size."
+                    ),
                 )
                 cols[2].metric("NDCG@10", f"{m.ndcg_at_10:.3f}")
                 cols[3].metric("Trained on", f"{m.n_train} films")
