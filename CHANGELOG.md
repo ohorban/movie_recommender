@@ -10,6 +10,29 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+- **The Update button in the Data tab died partway through with `NoSessionContext`.**
+  `ClaudeClient.map_structured` reported progress from inside its worker threads, and Streamlit
+  raises when a progress widget is touched off the main thread — so a database update crashed at the
+  review-structuring stage after twenty minutes of work. Progress is now reported from the calling
+  thread while the calls still run concurrently.
+- The same change restores cancellation. The main thread previously blocked inside
+  `list(pool.map(...))` with no `st.*` call of its own, so Streamlit had no point at which to
+  interrupt a long run — which is why a second click started a second pipeline alongside the first
+  rather than replacing it.
+- The UI progress callback now suppresses `NoSessionContext` as a backstop. Deliberately only that
+  one error: Streamlit cancels a running script by raising `StopException` / `RerunException`
+  through `st.*` calls, so swallowing those would leave an old run alive beside a new one.
+
+### Added
+- `test_progress_is_reported_from_the_calling_thread` drives the real `ClaudeClient` and pins the
+  contract; two further tests cover ordering under concurrency and that progress closes its span.
+- `test_progress_is_never_reported_from_a_worker_thread` runs the whole pipeline with a callback
+  that fails on any off-thread call, covering TMDB, Wikipedia and resolution.
+- The test LLM client now runs its calls through a thread pool like the real one. Running them
+  serially is what hid this bug.
+
+
 ## [0.1.9] — 2026-08-28
 
 ### Fixed

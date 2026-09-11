@@ -332,3 +332,40 @@ def test_readiness_is_clean_when_built(built):
         built["conn"], built["cfg"], backend=built["backend"], client=built["claude"]
     )
     assert engine.readiness() == (True, "")
+
+
+def test_progress_is_never_reported_from_a_worker_thread(tmp_config, conn, library_export):
+    """No pipeline stage may report progress from a background thread.
+
+    The Streamlit UI passes a callback that writes to a progress widget, and
+    Streamlit raises NoSessionContext when a widget is touched off the main
+    thread. One stage doing this killed a running database update partway
+    through, after twenty minutes of work.
+
+    SCOPE: this covers the stages that fan out with their own thread pools —
+    TMDB detail fetching, Wikipedia, and title resolution. It does *not* cover
+    the LLM client, because the test injects a stand-in for it; that contract
+    is pinned by `test_progress_is_reported_from_the_calling_thread` in
+    tests/test_llm.py, which drives the real ClaudeClient. Verified: with the
+    bug reintroduced this test still passes and that one fails.
+    """
+    import threading
+
+    shutil.copytree(library_export, tmp_config.data_dir / library_export.name)
+    main_thread = threading.get_ident()
+    offenders: list[tuple[str, str]] = []
+
+    def progress(message: str, _fraction: float) -> None:
+        if threading.get_ident() != main_thread:
+            offenders.append((message, threading.current_thread().name))
+
+    run(
+        tmp_config,
+        kind="setup",
+        conn=conn,
+        tmdb_client=FakeTMDBClient(n_movies=400),
+        llm_client=FakeClaudeClient(),
+        backend=HashBackend(dim=128),
+        progress=progress,
+    )
+    assert not offenders, f"progress reported off the main thread: {offenders[:3]}"
