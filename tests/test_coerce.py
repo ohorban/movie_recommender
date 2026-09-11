@@ -20,6 +20,7 @@ from movierec.enrich.coerce import (
     normalize_pitches,
     normalize_review_facts,
     normalize_summary,
+    unwrap_tool_fragment,
 )
 from movierec.enrich.structuring import DOSSIER_SCALES
 
@@ -157,3 +158,53 @@ def test_everything_survives_total_garbage():
         assert normalize_dossier(bad, DOSSIER_SCALES)["tone"] == []
         assert normalize_pitches(bad) == {}
         assert normalize_summary(bad)["loves"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Leaked tool-call framing
+# --------------------------------------------------------------------------- #
+# A tool call is XML on the wire. Claude occasionally emits one of its tags
+# inside a field value rather than closing the field, so a list of strings
+# arrives as one string starting `<parameter name="loves">`. This reached
+# production: the Insights tab rendered the raw tag, and the same string was
+# sent back to Claude in the taste brief on every Ask request.
+LEAKED = (
+    '<parameter name="loves">["Original high-concept sci-fi with emotional payoff", '
+    '"Animation that hits emotionally as well as visually"]'
+)
+
+
+def test_a_leaked_parameter_tag_is_unwrapped_not_rendered():
+    summary = normalize_summary({"headline": "A viewer.", "loves": [LEAKED]})
+    assert summary["loves"] == [
+        "Original high-concept sci-fi with emotional payoff",
+        "Animation that hits emotionally as well as visually",
+    ]
+    assert not any("<parameter" in x for x in summary["loves"])
+
+
+def test_a_leaked_tag_around_prose_keeps_the_prose():
+    summary = normalize_summary(
+        {"headline": '<parameter name="headline">A big-concept viewer.</parameter>'}
+    )
+    assert summary["headline"] == "A big-concept viewer."
+
+
+def test_unwrapping_leaves_ordinary_values_alone():
+    """The repair must not touch the 99.9% of payloads that are well formed."""
+    assert unwrap_tool_fragment("tense") == "tense"
+    assert unwrap_tool_fragment(["a", "b"]) == ["a", "b"]
+    assert unwrap_tool_fragment(None) is None
+    # Angle brackets in prose are not a tool call.
+    assert unwrap_tool_fragment("a film about <3 and maths") == "a film about <3 and maths"
+    assert as_str_list("tense") == ["tense"]
+    assert as_str_list(["tense", "hushed"]) == ["tense", "hushed"]
+
+
+def test_a_leaked_tag_inside_a_dossier_list_is_unwrapped():
+    """The same leak can land on any list field, not just the summary."""
+    dossier = normalize_dossier(
+        {"tone": '<parameter name="tone">["hushed", "elliptical"]</parameter>'},
+        ["darkness"],
+    )
+    assert dossier["tone"] == ["hushed", "elliptical"]

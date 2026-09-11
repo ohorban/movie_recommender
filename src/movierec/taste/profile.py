@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 
 from ..db import blob_to_vector, fetch_all, transaction, utcnow
+from ..enrich.coerce import normalize_summary
 from ..enrich.embeddings import MOVIE, EmbeddingBackend
 from ..enrich.structuring import DOSSIER_SCALES, load_dossiers, load_review_facts
 from ..logging_utils import get_logger
@@ -637,7 +638,9 @@ def load_profile(conn: sqlite3.Connection, backend_name: str | None = None) -> T
         scale_targets=payload.get("scale_targets", {}),
         scale_weights=payload.get("scale_weights", {}),
         taste_signals=payload.get("taste_signals", []),
-        summary=payload.get("summary"),
+        # Normalised on read as well as on write, so a profile already stored
+        # with a malformed summary is repaired without paying to regenerate it.
+        summary=normalize_summary(payload["summary"]) if payload.get("summary") else None,
         embed_model=payload.get("embed_model", ""),
     )
     vec_rows = fetch_all(

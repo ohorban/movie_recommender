@@ -198,11 +198,11 @@ INTENT_SCHEMA: dict[str, Any] = {
     "properties": {
         "semantic_query": {
             "type": "string",
-            "description": "A rich descriptive paragraph of the ideal film for this request, written as if describing an actual movie. This is embedded and matched against film descriptions, so be concrete and evocative rather than abstract.",
+            "description": "A rich descriptive paragraph of the ideal film for this request, written as if describing an actual movie. This is embedded and matched against film descriptions, so be concrete and evocative rather than abstract. Its subject is the request's subject: do not introduce a genre, premise or setting the request did not ask for, even one the viewer reliably likes.",
         },
         "interpretation": {
             "type": "string",
-            "description": "One sentence back to the user on how you read their request.",
+            "description": "One sentence back to the user on how you read their request, shown as 'Reading that as:'. It must be recognisable as their own request - if it contains anything they did not say and would not expect, it is wrong.",
         },
         "include_genres": {
             "type": "array",
@@ -319,7 +319,7 @@ PITCH_SCHEMA: dict[str, Any] = {
                     },
                     "because": {
                         "type": "string",
-                        "description": "One sentence connecting it to this viewer's own history, citing a specific film they rated or something they wrote in a review. Be concrete: name the film. If nothing in their history genuinely supports it, say what makes it a stretch instead of inventing a connection.",
+                        "description": "One sentence naming a durable preference of this viewer (from MEASURED PREFERENCES) and the property of this film that meets it. Second person: 'You go for X, and this is X.' Never name a film they have seen and never quote their reviews - one film they liked is not a reason for another. If no listed trait applies, say plainly that this is outside their usual range and what it is offered for.",
                     },
                     "caveat": {
                         "type": "string",

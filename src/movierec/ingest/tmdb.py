@@ -17,6 +17,7 @@ from ..config import Config
 from ..db import content_hash, fetch_all, insert_ignore, scalar, transaction, upsert, utcnow
 from ..http_cache import CachedSession
 from ..logging_utils import get_logger
+from ..media import MOVIE, TV, internal_id, split_id
 from ..text_utils import clean_ws, parse_year, truncate
 
 log = get_logger("ingest.tmdb")
@@ -75,12 +76,46 @@ class TMDBClient:
             {"append_to_response": "keywords,credits,reviews,external_ids", "language": "en-US"},
         )
 
+    def tv_detail(self, tmdb_id: int) -> dict[str, Any] | None:
+        """A show, shaped like a film.
+
+        `aggregate_credits` is the television equivalent of `credits`: it rolls
+        a performer's work up across every episode instead of listing one.
+        """
+        payload = self._get(
+            f"/tv/{tmdb_id}",
+            {
+                "append_to_response": "keywords,aggregate_credits,reviews,external_ids",
+                "language": "en-US",
+            },
+        )
+        return _tv_to_movie_shape(payload) if payload else payload
+
+    def detail(self, media_type: str, tmdb_id: int) -> dict[str, Any] | None:
+        return self.tv_detail(tmdb_id) if media_type == TV else self.movie_detail(tmdb_id)
+
     def search(self, title: str, year: int | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"query": title, "include_adult": "false"}
         if year:
             params["year"] = year
         payload = self._get("/search/movie", params, max_age_days=90) or {}
-        return payload.get("results", []) or []
+        results = payload.get("results", []) or []
+        for r in results:
+            r["media_type"] = MOVIE
+        return results
+
+    def search_tv(self, title: str, year: int | None = None) -> list[dict[str, Any]]:
+        """Search television, normalised to the movie search shape.
+
+        Letterboxd logs shows alongside films, and TMDB's movie index does not
+        contain them. Without this, every show either found nothing or matched
+        an unrelated film that happened to share a word with the title.
+        """
+        params: dict[str, Any] = {"query": title, "include_adult": "false"}
+        if year:
+            params["first_air_date_year"] = year
+        payload = self._get("/search/tv", params, max_age_days=90) or {}
+        return [_tv_to_movie_shape(r) for r in (payload.get("results", []) or [])]
 
     def find_by_imdb(self, imdb_id: str) -> list[dict[str, Any]]:
         payload = (
@@ -92,9 +127,70 @@ class TMDBClient:
 # --------------------------------------------------------------------------- #
 # Row shaping
 # --------------------------------------------------------------------------- #
+def _tv_to_movie_shape(show: dict[str, Any]) -> dict[str, Any]:
+    """Rename a TV payload's fields to their film equivalents.
+
+    Done once, here, so nothing downstream needs to know which kind of thing it
+    is holding. The id is shifted into this database's key space by
+    :func:`movierec.media.internal_id`, and the original TMDB id is preserved
+    so detail fetches and links can still address it.
+    """
+    out = dict(show)
+    source_id = int(show["id"])
+    out["id"] = internal_id(TV, source_id)
+    out["media_type"] = TV
+    out["source_tmdb_id"] = source_id
+    out["title"] = show.get("name") or show.get("original_name") or ""
+    out["original_title"] = show.get("original_name") or ""
+    out["release_date"] = show.get("first_air_date") or None
+
+    # A show has no single runtime. Prefer the typical episode length, which is
+    # the number a viewer would recognise, over the total of every episode.
+    runtimes = [r for r in (show.get("episode_run_time") or []) if r]
+    if not runtimes:
+        last = show.get("last_episode_to_air") or {}
+        if last.get("runtime"):
+            runtimes = [last["runtime"]]
+    out["runtime"] = runtimes[0] if runtimes else None
+
+    # `created_by` is television's closest analogue to a director, and the one
+    # credit a viewer would name. Fold it into the crew so the rest of the
+    # pipeline - documents, the director affinity - picks it up unchanged.
+    credits = dict(show.get("aggregate_credits") or show.get("credits") or {})
+    crew = list(credits.get("crew") or [])
+    for creator in show.get("created_by") or []:
+        crew.append({**creator, "job": "Director", "department": "Directing"})
+    cast = []
+    for member in credits.get("cast") or []:
+        roles = member.get("roles") or []
+        cast.append(
+            {
+                **member,
+                "character": (roles[0].get("character") if roles else member.get("character"))
+                or "",
+                "order": member.get("order", len(cast)),
+            }
+        )
+    out["credits"] = {"cast": cast, "crew": crew}
+    out.pop("aggregate_credits", None)
+
+    # /movie returns keywords under "keywords"; /tv returns them under
+    # "results". Same field, same append_to_response, different key.
+    keywords = show.get("keywords") or {}
+    out["keywords"] = {"keywords": keywords.get("keywords") or keywords.get("results") or []}
+
+    out["belongs_to_collection"] = None
+    out["budget"] = None
+    out["revenue"] = None
+    return out
+
+
 def _summary_row(item: dict[str, Any], origin: str) -> dict[str, Any]:
+    media_type, source_id = split_id(item["id"])
     return {
         "tmdb_id": item["id"],
+        "media_type": media_type,
+        "source_tmdb_id": source_id,
         "title": clean_ws(item.get("title") or item.get("original_title") or ""),
         "original_title": clean_ws(item.get("original_title")),
         "year": parse_year(item.get("release_date")),
@@ -117,8 +213,11 @@ def _summary_row(item: dict[str, Any], origin: str) -> dict[str, Any]:
 def _detail_row(d: dict[str, Any]) -> dict[str, Any]:
     collection = d.get("belongs_to_collection") or {}
     countries = ",".join(c.get("iso_3166_1", "") for c in (d.get("production_countries") or []))
+    media_type, source_id = split_id(d["id"])
     return {
         "tmdb_id": d["id"],
+        "media_type": media_type,
+        "source_tmdb_id": source_id,
         "imdb_id": (d.get("imdb_id") or (d.get("external_ids") or {}).get("imdb_id")) or None,
         "title": clean_ws(d.get("title") or d.get("original_title") or ""),
         "original_title": clean_ws(d.get("original_title")),
@@ -385,10 +484,13 @@ def fetch_details(
 
 def _safe_detail(client: TMDBClient) -> Callable[[int], dict[str, Any] | None]:
     def _inner(tmdb_id: int) -> dict[str, Any] | None:
+        # The key carries its own namespace, so a show routes to /tv and a film
+        # to /movie without the caller having to track which it asked for.
+        media_type, source_id = split_id(tmdb_id)
         try:
-            return client.movie_detail(tmdb_id)
+            return client.detail(media_type, source_id)
         except Exception as exc:  # network hiccup on one film must not kill the run
-            log.warning("detail fetch failed for %s: %s", tmdb_id, exc)
+            log.warning("detail fetch failed for %s/%s: %s", media_type, source_id, exc)
             return None
 
     return _inner
@@ -418,9 +520,9 @@ def ensure_movies(
     if todo:
         # A film the user actually watched belongs in the catalog whatever its vote count.
         conn.executemany(
-            "INSERT INTO movies (tmdb_id, title, origin, in_catalog) VALUES (?, '', 'user', 1) "
-            "ON CONFLICT (tmdb_id) DO UPDATE SET in_catalog = 1",
-            [(i,) for i in todo],
+            "INSERT INTO movies (tmdb_id, title, origin, in_catalog, media_type, source_tmdb_id) "
+            "VALUES (?, '', 'user', 1, ?, ?) ON CONFLICT (tmdb_id) DO UPDATE SET in_catalog = 1",
+            [(i, *split_id(i)) for i in todo],
         )
         fetch_details(conn, client, todo, progress=progress, progress_span=(0.55, 0.6))
     return len(todo)
@@ -429,6 +531,11 @@ def ensure_movies(
 def catalog_stats(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         "movies": scalar(conn, "SELECT COUNT(*) FROM movies WHERE in_catalog = 1", default=0),
+        "tv": scalar(
+            conn,
+            "SELECT COUNT(*) FROM movies WHERE in_catalog = 1 AND media_type = 'tv'",
+            default=0,
+        ),
         "with_detail": scalar(
             conn, "SELECT COUNT(*) FROM movies WHERE detail_level = 2", default=0
         ),

@@ -10,7 +10,63 @@ manual migration step*, and is always called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Television.** Letterboxd logs shows next to films; TMDB keeps movies and series in separate id
+  namespaces and the matcher only ever searched movies. Every show therefore either found nothing
+  or attached itself to a film that shared a word with the title — *Baby Reindeer* to
+  *A Baby Reindeer's First Christmas*, *Chernobyl* to a documentary about the exclusion zone, and
+  *Chernobyl* is a five-star film that anchors one of the taste clusters. Both indexes are now
+  searched and the candidates compete on one scale.
+- Shows are stored under their TMDB id plus an offset, with `media_type` and the original id
+  alongside (migration 003). Shifting the id is far less invasive than making `(id, media_type)`
+  the key of a dozen tables, and `movierec.media` is the only place that does the arithmetic.
+- A show is taste evidence, never a recommendation: television is excluded from the candidate pool
+  explicitly rather than incidentally.
+- The recommendation card names the director, links to IMDb and Letterboxd as well as TMDB, and
+  shows your own rating when you have one.
+
+- `RankerMetrics` carries `spearman_sd` and `cv_repeats`, both persisted with the model.
+- Four tests cover the averaged-score path: that the averages (not a single split) drive selection,
+  that a learned model still wins when it earns it, that an untrained model is never selected, and
+  that the spread survives a save and reload.
+- `test_progress_is_reported_from_the_calling_thread` drives the real `ClaudeClient` and pins the
+  contract; two further tests cover ordering under concurrency and that progress closes its span.
+- `test_progress_is_never_reported_from_a_worker_thread` runs the whole pipeline with a callback
+  that fails on any off-thread call, covering TMDB, Wikipedia and resolution.
+- The test LLM client now runs its calls through a thread pool like the real one. Running them
+  serially is what hid this bug.
+
 ### Fixed
+
+- **Correcting a bad match silently did nothing.** Two independent faults. The id typed into the
+  Fix box never reached the handler, because a plain widget beside a plain button hands Streamlit
+  the click before the typed value commits — so the old value was submitted. The handler then
+  wrote a *null* override, which pinned the film to "no match found" permanently and reapplied
+  itself on every subsequent run. It is now a form (which gathers its widgets on submit), it
+  accepts a pasted TMDB address as well as a bare id, and an unreadable paste is an error rather
+  than a silent erasure. Migration 003 clears the two null overrides this produced.
+- **A one-year release-date disagreement outranked an identical title.** Letterboxd dates
+  *Obsession* to 2025 and TMDB to 2026; the match was correct and got flagged for review anyway,
+  along with *Enemy*, *Talk to Me*, *Oculus*, *Am I OK?* and *Queen of the Ring*. An exact title
+  now carries most of the decision when the years are within two. A larger gap gets no such
+  benefit — same title, decades apart, is what a remake looks like.
+- **A short title inside a much longer one scored as a match.** `fuzz.WRatio` has a partial-ratio
+  arm, so *Baby Reindeer* scored 0.64 against *A Baby Reindeer's First Christmas* and cleared the
+  review floor. Candidates whose title is much longer than the query are now discounted.
+- Everything still awaiting review is re-matched by migration 003, since all of the above was
+  decided by a matcher that no longer exists. Confirmed matches are untouched.
+- **The Insights tab rendered a raw `<parameter name="loves">` tag.** Claude emitted the XML
+  framing of its own tool call *inside* a field value; the content after the tag was well formed,
+  only the framing leaked. It rendered verbatim under "Reliably works for you", and the same string
+  was being sent back to Claude in the taste brief attached to every Ask request. Leaked framing is
+  now unwrapped and the value recovered — on read as well as on write, so your existing profile is
+  repaired without paying to regenerate it.
+- **The Tonight tab recomputed an identical answer on every page load.** Ranking 30,046 films and
+  writing eight explanations is seconds of work plus a paid Claude call, and none of it is random,
+  so a refresh bought the same five films twice. The pick is now stored in the database and reused
+  until the data changes or Reroll is pressed.
+
 - **The Update button in the Data tab died partway through with `NoSessionContext`.**
   `ClaudeClient.map_structured` reported progress from inside its worker threads, and Streamlit
   raises when a progress widget is touched off the main thread — so a database update crashed at the
@@ -25,6 +81,27 @@ manual migration step*, and is always called out explicitly.
   through `st.*` calls, so swallowing those would leave an old run alive beside a new one.
 
 ### Changed
+
+- **"Why you" no longer justifies one film with another.** It read *"You wrote that Mulan is not
+  often a movie that makes me cry, and this is built for exactly that kind of animated gut-punch"* —
+  a claim specific enough to be wrong often, and not what a preference is. Explanations are now
+  drawn from a closed list of measured traits (genre and tag affinities, scale sweet spots, what
+  the reviews praise and complain about), all aggregated over the whole history, and naming a film
+  you have seen is forbidden.
+- **The Ask tab stopped importing your taste as subject matter.** Asked for "something that will
+  make me feel existential about romantic relationships", it read that as a request for science
+  fiction, because science fiction is what the profile says you like. The taste summary now fills
+  gaps the request leaves open — how dark, how demanding, how long — and may not add a genre,
+  premise or setting the request did not ask for.
+- **A specific request no longer returns the same film as an open one.** *The Prestige* led both the
+  Tonight tab and that relationships query. Two causes, both fixed: the taste-only retrieval sources
+  ran at full size even when a request was made, flooding the pool with well-reviewed films that
+  had nothing to do with it; and the taste score has a long right tail — a famous, widely loved film
+  lands four standard deviations out — while semantic similarity is near-symmetric, so one outlier
+  outscored an excellent match whatever weight the request was given. Sources are now scaled back
+  when there is a request, and both terms are clipped before blending. On the real database that
+  query goes from *Her, The Prestige, Contact, Toy Story* to *Her, Contact, Room, Magnolia*.
+
 - **The reported ranker accuracy is now an average over five fold splits instead of one.** With 163
   rated films, which films land in which fold moves the held-out Spearman by more than any change
   made to the model: measured on unchanged data and an unchanged model, it ranged 0.445–0.514
@@ -36,24 +113,12 @@ manual migration step*, and is always called out explicitly.
 - The Insights tab shows the accuracy as `mean ± sd`. Read the spread first: a difference smaller
   than it is not a difference.
 
-### Added
-- `RankerMetrics` carries `spearman_sd` and `cv_repeats`, both persisted with the model.
-- Four tests cover the averaged-score path: that the averages (not a single split) drive selection,
-  that a learned model still wins when it earns it, that an untrained model is never selected, and
-  that the spread survives a save and reload.
-- `test_progress_is_reported_from_the_calling_thread` drives the real `ClaudeClient` and pins the
-  contract; two further tests cover ordering under concurrency and that progress closes its span.
-- `test_progress_is_never_reported_from_a_worker_thread` runs the whole pipeline with a callback
-  that fails on any off-thread call, covering TMDB, Wikipedia and resolution.
-- The test LLM client now runs its calls through a thread pool like the real one. Running them
-  serially is what hid this bug.
-
 ### Note
+
 The first version of the averaging above averaged the *predictions* across the five splits and
 scored those. That measures a five-model ensemble, not the single model that actually gets deployed,
 and it flattered the ridge model into winning. Averaging the *metrics* is the correct form: each
 split scores the model as it will be used, and the five scores are then summarised.
-
 
 ## [0.1.9] — 2026-08-28
 

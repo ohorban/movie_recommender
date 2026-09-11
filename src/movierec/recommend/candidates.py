@@ -45,6 +45,20 @@ class CandidatePool:
         return len(self.sources)
 
 
+def tv_tmdb_ids(conn: sqlite3.Connection) -> set[int]:
+    """Shows, which are taste evidence but never a recommendation.
+
+    Television enters the database only through the user's own Letterboxd
+    history, so every show is already watched and would be filtered anyway -
+    but the exclusion is explicit rather than incidental, because this is a
+    film recommender and a show surfacing as "tonight's pick" would be a bug.
+    """
+    return {
+        int(r["tmdb_id"])
+        for r in fetch_all(conn, "SELECT tmdb_id FROM movies WHERE media_type = 'tv'")
+    }
+
+
 def seen_tmdb_ids(conn: sqlite3.Connection) -> set[int]:
     """Everything the user has already watched or logged."""
     rows = fetch_all(
@@ -96,7 +110,7 @@ def generate(
     the natural-language layer imposes genre, year or runtime constraints).
     """
     per_source = per_source or cfg.candidates_per_source
-    exclude = set(exclude or set())
+    exclude = set(exclude or set()) | tv_tmdb_ids(conn)
     pool = CandidatePool()
 
     allowed: set[str] | None = (
@@ -117,9 +131,19 @@ def generate(
             if taken >= k:
                 break
 
+    # When the user actually asked for something, the pool has to be mostly
+    # about the request. The taste-only sources still run - they are what keeps
+    # a request answered in *this* viewer's terms - but at a fraction of their
+    # usual size, and the two sources that are pure taste with no request
+    # content at all do not run. Left at full size they flood the pool with
+    # well-reviewed films the viewer would probably enjoy on any other night,
+    # and the best of those outranks a real answer to the question asked.
+    focused = query_vector is not None
+    taste_k = max(15, per_source // 3) if focused else per_source
+
     # 1. Each mode of taste retrieves its own neighbourhood.
     for mode in profile.modes:
-        k = max(40, int(per_source * mode.weight))
+        k = max(40 if not focused else 12, int(taste_k * mode.weight))
         _search(mode.centroid, k, f"taste:{mode.label[:28]}", 1.0)
 
     # 2. Nearest neighbours of individual favourites - narrower and more literal.
@@ -130,7 +154,7 @@ def generate(
     ):
         vec = store.vector(str(row["tmdb_id"]))
         if vec is not None:
-            _search(vec, 30, f"similar-to:{row['title']}", 0.95)
+            _search(vec, 10 if focused else 30, f"similar-to:{row['title']}", 0.95)
 
     # 3. Collaborative filtering: taste-adjacent rather than description-adjacent.
     liked_rows = fetch_all(
@@ -160,11 +184,15 @@ def generate(
             pool.add(tmdb_id, "viewers-like-you", min(1.0, score / 10.0))
 
     # 4. Facet rules: strong genre/tag affinity plus a quality floor.
-    top_genres = [
-        g
-        for g, v in sorted(profile.affinities.get("genre", {}).items(), key=lambda t: -t[1])[:4]
-        if v > 0.05
-    ]
+    top_genres = (
+        []
+        if focused
+        else [
+            g
+            for g, v in sorted(profile.affinities.get("genre", {}).items(), key=lambda t: -t[1])[:4]
+            if v > 0.05
+        ]
+    )
     if top_genres:
         ph = ",".join("?" for _ in top_genres)
         for r in fetch_all(
@@ -189,7 +217,7 @@ def generate(
             pool.add(tmdb_id, "your-watchlist", 0.5)
 
     # 6. Deliberate exploration: acclaimed films far from every taste centroid.
-    if cfg.exploration_ratio > 0 and profile.modes and len(store):
+    if cfg.exploration_ratio > 0 and profile.modes and len(store) and not focused:
         sims = np.max(np.vstack([store.similarity(m.centroid) for m in profile.modes]), axis=0)
         quality = _quality_lookup(conn, store.ids)
         far = np.argsort(sims)  # least similar first
@@ -207,9 +235,10 @@ def generate(
             if taken >= budget:
                 break
 
-    # 7. Whatever the request itself asked for.
+    # 7. Whatever the request itself asked for - the largest source by far
+    #    once there is a request, rather than one voice among seven.
     if query_vector is not None:
-        _search(query_vector, per_source, "matches-your-request", 1.0)
+        _search(query_vector, per_source * 2, "matches-your-request", 1.0)
 
     log.info(
         "candidate pool: %d films from %d sources",

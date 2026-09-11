@@ -18,14 +18,48 @@ records already stored without paying to regenerate them.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 DEFAULT_ASPECT_CATEGORY = "other"
 DEFAULT_STRENGTH = 0.5
 
+# A tool call is XML on the wire, and the model occasionally emits one of those
+# tags *inside* a field value instead of closing the field - so a list of
+# strings arrives as a single string beginning `<parameter name="loves">`. The
+# content after the tag is well-formed; only the framing leaked. This was
+# rendering verbatim in the Insights tab and being sent to Claude as part of
+# the taste brief on every natural-language request.
+_TOOL_FRAGMENT = re.compile(
+    r"<\s*(?:parameter|antml:parameter)\b[^>]*>(.*?)(?:<\s*/\s*(?:parameter|antml:parameter)\s*>|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def unwrap_tool_fragment(value: Any) -> Any:
+    """Recover the value out of a leaked tool-call tag.
+
+    Returns the parsed contents when the tag wrapped JSON, the inner text when
+    it wrapped prose, and the input untouched when there is no tag - which is
+    the overwhelmingly common case.
+    """
+    if not isinstance(value, str) or "<" not in value:
+        return value
+    match = _TOOL_FRAGMENT.search(value)
+    if not match:
+        return value
+    inner = match.group(1).strip()
+    if inner[:1] in "[{":
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            pass
+    return inner
+
 
 def as_obj(value: Any) -> dict[str, Any]:
     """A dict, parsing a JSON-object string if that is what we were handed."""
+    value = unwrap_tool_fragment(value)
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -58,7 +92,11 @@ def as_str_list(value: Any) -> list[str]:
     five single-character tags.
     """
     out: list[str] = []
-    for item in as_list(value):
+    for item in as_list(unwrap_tool_fragment(value)):
+        item = unwrap_tool_fragment(item)
+        if isinstance(item, list):
+            out.extend(as_str_list(item))
+            continue
         if isinstance(item, str):
             text = item.strip()
         elif isinstance(item, dict):
@@ -71,6 +109,12 @@ def as_str_list(value: Any) -> list[str]:
 
 
 def as_str(value: Any, default: str = "") -> str:
+    # Only a string can carry leaked tool-call framing, and unwrapping one may
+    # yield a list. Everything else keeps the old contract: a structure is not
+    # a string and does not become one.
+    if isinstance(value, str):
+        unwrapped = unwrap_tool_fragment(value)
+        value = (unwrapped[0] if unwrapped else "") if isinstance(unwrapped, list) else unwrapped
     if isinstance(value, str):
         return value.strip()
     if value is None:

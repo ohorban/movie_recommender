@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from typing import Any
 
@@ -24,6 +24,7 @@ from ..enrich.llm import ClaudeClient
 from ..enrich.schemas import PITCH_SCHEMA
 from ..enrich.structuring import DOSSIER_SCALES, generate_dossiers, load_dossiers
 from ..logging_utils import get_logger
+from ..media import split_id, tmdb_url
 from ..taste.profile import TasteProfile, load_profile, load_user_ratings, preference_scores
 from . import candidates as cand
 from .features import FeatureBuilder
@@ -37,18 +38,28 @@ DOSSIER_BUDGET = 24  # how many finalists earn an on-demand Claude dossier
 
 PITCH_SYSTEM = """You write short, honest recommendation notes for one specific person.
 
-You are given their taste profile, films they have rated with their own words, and a shortlist \
-the recommender produced. For each film write a hook, a because and a caveat.
+You are given measured facts about what this viewer reliably likes, a shortlist the recommender \
+produced, and their history for background. For each film write a hook, a because and a caveat.
 
-Rules:
-- The `because` must cite something real from their history by name. "You gave Top Gun: Maverick \
-5 and wrote about the problem-solving" is good. "This matches your love of thrillers" is not.
-- Never claim they have seen something that is not in the material given to you.
-- If a film is a genuine stretch, say so in `because` rather than manufacturing a connection. A \
-recommender that admits uncertainty is more useful than one that does not.
-- The `caveat` is for real friction - pacing, length, bleakness, subtitles, a divisive ending. \
-Leave it empty rather than inventing a flaw.
-- No marketing language. No "a masterclass in", no "tour de force", no "you won't believe"."""
+The `because` explains the film in terms of the viewer's *durable preferences*, never as a bridge \
+from one film to another.
+
+- Write it as a trait they have and a property this film has: "You go for X, and this is X."
+- Use only the traits listed under MEASURED PREFERENCES. Those are computed from their whole \
+history, so they hold across many films.
+- Do NOT name any film they have seen. "You wrote that Mulan made you cry, and this is that kind \
+of gut-punch" is exactly wrong: one film they liked is not a reason for a different film. Their \
+history is there to help you pick which trait is relevant, not to be quoted back at them.
+- Do NOT quote their reviews.
+- If none of the listed traits genuinely applies, say plainly that this one is outside their usual \
+range and what it is being offered for. A recommender that admits a stretch is more useful than \
+one that manufactures a connection.
+
+The `hook` is about the film itself and may be as specific as you like. The `caveat` is for real \
+friction - pacing, length, bleakness, subtitles, a divisive ending. Leave it empty rather than \
+inventing a flaw.
+
+No marketing language. No "a masterclass in", no "tour de force", no "you won't believe"."""
 
 
 @dataclass
@@ -67,6 +78,9 @@ class Recommendation:
     language: str | None = None
     tmdb_rating: float | None = None
     imdb_rating: float | None = None
+    imdb_id: str | None = None
+    director: str = ""
+    your_rating: float | None = None
     on_watchlist: bool = False
     dossier: dict[str, Any] | None = None
     features: dict[str, float] = field(default_factory=dict)
@@ -80,7 +94,21 @@ class Recommendation:
 
     @property
     def tmdb_url(self) -> str:
-        return f"https://www.themoviedb.org/movie/{self.tmdb_id}"
+        return tmdb_url(self.tmdb_id)
+
+    @property
+    def imdb_url(self) -> str | None:
+        return f"https://www.imdb.com/title/{self.imdb_id}/" if self.imdb_id else None
+
+    @property
+    def letterboxd_url(self) -> str | None:
+        """Letterboxd resolves a TMDB id without needing the film's slug.
+
+        Television is not on Letterboxd, so shows get no link rather than a
+        broken one.
+        """
+        media_type, source = split_id(self.tmdb_id)
+        return None if media_type == "tv" else f"https://letterboxd.com/tmdb/{source}/"
 
 
 @dataclass
@@ -90,6 +118,77 @@ class RecommendationResult:
     pool_size: int = 0
     ranker_kind: str = "heuristic"
     notes: list[str] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "items": [asdict(i) for i in self.items],
+            "intent": asdict(self.intent),
+            "pool_size": self.pool_size,
+            "ranker_kind": self.ranker_kind,
+            "notes": list(self.notes),
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any]) -> RecommendationResult:
+        return cls(
+            items=[Recommendation(**i) for i in payload.get("items", [])],
+            intent=Intent(**payload.get("intent", {})),
+            pool_size=int(payload.get("pool_size", 0)),
+            ranker_kind=str(payload.get("ranker_kind", "heuristic")),
+            notes=list(payload.get("notes", [])),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Remembering tonight's pick
+# --------------------------------------------------------------------------- #
+# Ranking 30,046 films and writing eight explanations is seconds of work and a
+# paid Claude call. Nothing about it is random, so reloading the page used to
+# spend both to arrive at exactly the same answer. The pick is therefore stored
+# and reused until something that should change it actually changes.
+def picks_signature(conn: sqlite3.Connection) -> str:
+    """Everything whose change should produce a different pick.
+
+    Deliberately not a timestamp: the point is that an identical database
+    yields an identical key, so restarting the app reuses the stored pick
+    instead of paying to recompute it.
+    """
+    from ..db import content_hash, scalar
+
+    return content_hash(
+        scalar(conn, "SELECT COALESCE(MAX(created_at), '') FROM model_artifacts", default=""),
+        scalar(conn, "SELECT COUNT(*) FROM feedback", default=0),
+        scalar(conn, "SELECT COUNT(*) FROM user_films", default=0),
+        scalar(conn, "SELECT COUNT(*) FROM user_ratings", default=0),
+    )
+
+
+def load_picks(
+    conn: sqlite3.Connection, signature: str
+) -> tuple[RecommendationResult, list[int]] | None:
+    """The stored pick, if it was made from the database as it stands now."""
+    from ..db import kv_get
+
+    stored = kv_get(conn, "tonight")
+    if not isinstance(stored, dict) or stored.get("signature") != signature:
+        return None
+    try:
+        return RecommendationResult.from_json(stored["result"]), list(stored.get("seen", []))
+    except (KeyError, TypeError):
+        return None
+
+
+def save_picks(
+    conn: sqlite3.Connection, signature: str, result: RecommendationResult, seen: list[int]
+) -> None:
+    from ..db import kv_set
+
+    kv_set(
+        conn,
+        "tonight",
+        {"signature": signature, "result": result.to_json(), "seen": [int(i) for i in seen]},
+    )
+    conn.commit()
 
 
 class RecommendationEngine:
@@ -292,7 +391,14 @@ class RecommendationEngine:
             if vecs.size:
                 lookup = dict(zip(keys, (vecs @ _unit(query_vec)).tolist()))
                 sem = np.array([lookup.get(str(i), 0.0) for i in ids], dtype=np.float32)
-            final = w * taste_z + (1.0 - w) * _zscore(sem)
+            # Clip before blending. The taste score has a long right tail - a
+            # famous, widely loved film lands four standard deviations out -
+            # while semantic similarity is near-symmetric. Unclipped, one
+            # outlier on the taste side outscores an excellent match on the
+            # request side no matter what weight the request was given, which
+            # is how the same film led both an open "what should I watch" and a
+            # specific request that had nothing to do with it.
+            final = w * _clip_z(taste_z) + (1.0 - w) * _clip_z(_zscore(sem))
         else:
             final = taste_z
 
@@ -369,8 +475,30 @@ class RecommendationEngine:
             for r in fetch_all(
                 self.conn,
                 f"""SELECT tmdb_id, title, year, overview, tagline, runtime, poster_path,
-                           original_language, tmdb_vote_average, imdb_rating
+                           original_language, tmdb_vote_average, imdb_rating, imdb_id
                     FROM movies WHERE tmdb_id IN ({ph})""",
+                ids,
+            )
+        }
+        # The director is the credit a viewer actually recognises, and the one
+        # the ranker has an affinity feature for, so it belongs on the card.
+        directors: dict[int, str] = {}
+        for r in fetch_all(
+            self.conn,
+            f"""SELECT mc.tmdb_id, p.name FROM movie_credits mc JOIN people p USING(person_id)
+                WHERE mc.tmdb_id IN ({ph}) AND mc.role = 'crew' AND mc.job = 'Director'
+                ORDER BY mc.tmdb_id, p.popularity DESC""",
+            ids,
+        ):
+            directors.setdefault(r["tmdb_id"], r["name"])
+        # Only ever set when the viewer asked to include films they have seen;
+        # an unseen recommendation has no rating of their own by definition.
+        own_ratings = {
+            r["tmdb_id"]: r["rating"]
+            for r in fetch_all(
+                self.conn,
+                f"""SELECT f.tmdb_id, r.rating FROM user_ratings r JOIN user_films f USING(film_key)
+                    WHERE f.tmdb_id IN ({ph})""",
                 ids,
             )
         }
@@ -403,6 +531,9 @@ class RecommendationEngine:
                     language=row["original_language"],
                     tmdb_rating=row["tmdb_vote_average"],
                     imdb_rating=row["imdb_rating"],
+                    imdb_id=row["imdb_id"],
+                    director=directors.get(tmdb_id, ""),
+                    your_rating=own_ratings.get(tmdb_id),
                     on_watchlist=tmdb_id in watchlist,
                     dossier=dossiers.get(tmdb_id),
                     features=fm.as_dict(tmdb_id) if tmdb_id in fm.ids else {},
@@ -438,8 +569,11 @@ class RecommendationEngine:
             kind="pitches",
             system=PITCH_SYSTEM,
             user=(
-                f"THEIR TASTE\n{self._taste_brief()}\n\n"
-                f"THEIR OWN WORDS ON FILMS THEY HAVE SEEN\n{evidence}\n\n"
+                f"MEASURED PREFERENCES (the only traits a `because` may cite)\n"
+                f"{self._measured_preferences()}\n\n"
+                f"SUMMARY OF THIS VIEWER\n{self._taste_brief()}\n\n"
+                f"BACKGROUND - their history, to help you choose which trait is relevant. "
+                f"Do not name these films in a `because`.\n{evidence}\n\n"
                 f"SHORTLIST\n" + "\n\n".join(lines)
             ),
             schema=PITCH_SCHEMA,
@@ -484,6 +618,54 @@ class RecommendationEngine:
 
         return _taste_brief(self.profile)
 
+    def _measured_preferences(self) -> str:
+        """The traits an explanation is allowed to cite.
+
+        Deliberately a closed list. Left to itself the model justifies a film
+        by pairing it with one the viewer happened to love, which is both too
+        specific to be right often and not what a preference is. Everything
+        here is aggregated over the whole history, so it stays true of the
+        viewer rather than of one evening.
+        """
+        p = self.profile
+        lines: list[str] = []
+
+        def _top(facet: str, n: int, up: str, down: str, floor: float = 0.12) -> None:
+            items = sorted(p.affinities.get(facet, {}).items(), key=lambda kv: -kv[1])
+            strong = [f"{k} ({v:+.2f})" for k, v in items[:n] if v >= floor]
+            if strong:
+                lines.append(f"- {up}: {', '.join(strong)}")
+            weak = [f"{k} ({v:+.2f})" for k, v in items[::-1][:3] if v <= -floor]
+            if weak:
+                lines.append(f"- {down}: {', '.join(weak)}")
+
+        _top("genre", 5, "Genres they rate above their own average", "Genres they rate below it")
+        _top("tag", 6, "Qualities they reward when a film has them", "Qualities that put them off")
+        _top("decade", 2, "Decades they favour", "Decades they avoid", floor=0.2)
+
+        for key, weight in sorted(p.scale_weights.items(), key=lambda kv: -kv[1])[:4]:
+            target = p.scale_targets.get(key)
+            if target is None or weight < 0.1:
+                continue
+            band = " (high)" if target >= 0.6 else (" (low)" if target <= 0.4 else "")
+            lines.append(
+                f"- {key.replace('_', ' ').capitalize()} is one of the axes that most predicts "
+                f"their rating (weight {weight:.2f}); their sweet spot is {target:.2f} of 1{band}"
+            )
+
+        aspects = sorted(p.aspect_affinity.items(), key=lambda kv: -kv[1])
+        liked = [k for k, v in aspects[:4] if v > 0.05]
+        disliked = [k for k, v in aspects[::-1][:3] if v < -0.05]
+        if liked:
+            lines.append(f"- Praises these in their reviews: {', '.join(liked)}")
+        if disliked:
+            lines.append(f"- Complains about these in their reviews: {', '.join(disliked)}")
+
+        runtime = sorted(p.affinities.get("runtime", {}).items(), key=lambda kv: -kv[1])
+        if runtime and runtime[0][1] >= 0.2:
+            lines.append(f"- Tolerates length well; best bucket is {runtime[0][0]} minutes")
+        return "\n".join(lines) or "- Not enough rated films yet to measure a stable preference."
+
     # ------------------------------------------------------------- feedback
     def record_feedback(
         self, tmdb_id: int, action: str, surface: str = "", context: dict | None = None
@@ -492,6 +674,16 @@ class RecommendationEngine:
             "INSERT INTO feedback (tmdb_id, action, surface, context_json) VALUES (?, ?, ?, ?)",
             (int(tmdb_id), action, surface, json.dumps(context or {})),
         )
+
+
+# Roughly the 99th percentile of a normal distribution: wide enough to keep the
+# ordering of everything that is merely very good, narrow enough that a single
+# runaway score cannot decide a blend on its own.
+Z_CLIP = 2.5
+
+
+def _clip_z(values: np.ndarray) -> np.ndarray:
+    return np.clip(values, -Z_CLIP, Z_CLIP)
 
 
 def _zscore(values: np.ndarray) -> np.ndarray:

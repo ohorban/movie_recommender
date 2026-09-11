@@ -7,6 +7,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from movierec.ingest.tmdb import _tv_to_movie_shape
+
 GENRES = [
     (28, "Action"),
     (12, "Adventure"),
@@ -97,6 +99,58 @@ def make_movie(
     }
 
 
+def make_show(
+    tmdb_id: int, *, name: str, year: int = 2021, seed: int | None = None
+) -> dict[str, Any]:
+    """A TMDB *television* detail payload, in TMDB's own field names.
+
+    Not a movie payload with the title changed: the point of the fixture is
+    that `name`, `first_air_date`, `episode_run_time`, `created_by` and
+    `aggregate_credits` are what the /tv endpoints actually return, and the
+    production shim is what has to reconcile them.
+    """
+    rng = random.Random(seed if seed is not None else tmdb_id)
+    genres = rng.sample(GENRES, k=rng.randint(1, 3))
+    keywords = rng.sample(KEYWORDS, k=rng.randint(2, 4))
+    return {
+        "id": tmdb_id,
+        "name": name,
+        "original_name": name,
+        "first_air_date": f"{year}-0{rng.randint(1, 9)}-1{rng.randint(0, 9)}",
+        "episode_run_time": [rng.choice([28, 42, 55])],
+        "number_of_seasons": rng.randint(1, 4),
+        "original_language": "en",
+        "overview": f"A {genres[0][1].lower()} series about {keywords[0][1]}.",
+        "tagline": "",
+        "poster_path": f"/s{tmdb_id}.jpg",
+        "backdrop_path": None,
+        "homepage": "",
+        "adult": False,
+        "status": "Ended",
+        "popularity": round(rng.uniform(1, 90), 3),
+        "vote_average": round(rng.uniform(5.5, 9.0), 1),
+        "vote_count": rng.randint(80, 6000),
+        "genres": [{"id": g, "name": n} for g, n in genres],
+        "production_countries": [{"iso_3166_1": "GB", "name": "United Kingdom"}],
+        "created_by": [{"id": 90_000 + tmdb_id % 1000, "name": f"Creator {tmdb_id}"}],
+        "keywords": {"results": [{"id": k, "name": n} for k, n in keywords]},
+        "aggregate_credits": {
+            "cast": [
+                {
+                    "id": 70_000 + i,
+                    "name": f"Series Actor {tmdb_id}-{i}",
+                    "roles": [{"character": f"Role {i}"}],
+                    "order": i,
+                }
+                for i in range(4)
+            ],
+            "crew": [],
+        },
+        "external_ids": {"imdb_id": f"tt{tmdb_id:07d}"},
+        "reviews": {"results": []},
+    }
+
+
 class FakeTMDBClient:
     """Implements the surface of TMDBClient that the pipeline actually uses."""
 
@@ -110,6 +164,7 @@ class FakeTMDBClient:
             detail = make_movie(tmdb_id, year=year)
             self.details[tmdb_id] = detail
             self.by_year.setdefault(year, []).append(detail)
+        self.shows: dict[int, dict[str, Any]] = {}
         self.search_calls = 0
         self.detail_calls = 0
         self._lock = threading.Lock()
@@ -179,6 +234,33 @@ class FakeTMDBClient:
             }
             for d in hits
         ]
+
+    # -- television ---------------------------------------------------------
+    # Shows go through the real `_tv_to_movie_shape`, so the field renaming and
+    # id shifting are exercised by every test that touches resolution rather
+    # than being reimplemented (and quietly diverging) here.
+    def search_tv(self, title: str, year: int | None = None) -> list[dict[str, Any]]:
+        want = title.lower().strip()
+        with self._lock:
+            self.search_calls += 1
+            # Unlike `search`, this invents nothing. A real TV search returns
+            # results only for real shows, and a fake that always answered
+            # would hide the case where a film is wrongly read as a series.
+            hits = [s for s in self.shows.values() if s["name"].lower() == want]
+        return [_tv_to_movie_shape(s) for s in hits]
+
+    def tv_detail(self, tmdb_id: int) -> dict[str, Any] | None:
+        self.detail_calls += 1
+        show = self.shows.get(int(tmdb_id))
+        return _tv_to_movie_shape(show) if show else None
+
+    def detail(self, media_type: str, tmdb_id: int) -> dict[str, Any] | None:
+        return self.tv_detail(tmdb_id) if media_type == "tv" else self.movie_detail(tmdb_id)
+
+    def add_show(self, tmdb_id: int, name: str, *, year: int = 2021) -> dict[str, Any]:
+        show = make_show(tmdb_id, name=name, year=year)
+        self.shows[tmdb_id] = show
+        return show
 
     def find_by_imdb(self, imdb_id: str) -> list[dict[str, Any]]:
         return []

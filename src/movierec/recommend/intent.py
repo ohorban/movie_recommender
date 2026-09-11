@@ -39,9 +39,20 @@ Set `taste_weight` by how specific the request is:
 - "something funny" -> 0.7
 - "a slow character study set in rural Japan" -> 0.25
 - "the 1974 Coppola one about surveillance" -> 0.05
+A request that names a subject, a feeling or a situation is specific. If you can picture the film \
+from the request alone, `taste_weight` belongs below 0.4.
 
-You will be given a summary of this viewer's taste. Use it to interpret vague requests \
-("something cosy") in their terms, not in general terms. Never use it to override an explicit request."""
+You will be given a summary of this viewer's taste. It is for filling gaps the request leaves \
+open - how dark, how demanding, how long - and for reading vague words like "cosy" in their terms.
+
+It is NOT a source of subject matter. Do not add a genre, premise or setting the request did not \
+ask for, however reliably the viewer likes it. Asked for "something that will make me feel \
+existential about romantic relationships", a viewer who loves science fiction has asked about \
+relationships, not about science fiction: the `semantic_query` describes a film about \
+relationships, and their taste decides which *kind* of such film, not what it is about.
+
+`interpretation` is shown to the viewer as "Reading that as:". It must be recognisable as their \
+own request. If it contains anything they did not say and would not expect, it is wrong."""
 
 
 @dataclass

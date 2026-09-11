@@ -28,7 +28,13 @@ from movierec.config import load_config  # noqa: E402
 from movierec.db import init_db  # noqa: E402
 from movierec.ingest.letterboxd import latest_export_dir  # noqa: E402
 from movierec.ingest.resolve import set_override, unresolved_report  # noqa: E402
-from movierec.recommend.engine import RecommendationEngine  # noqa: E402
+from movierec.media import internal_id, parse_tmdb_reference  # noqa: E402
+from movierec.recommend.engine import (  # noqa: E402
+    RecommendationEngine,
+    load_picks,
+    picks_signature,
+    save_picks,
+)
 from movierec.recommend.ranker import TasteRanker  # noqa: E402
 from movierec.taste import insights as ins  # noqa: E402
 from movierec.taste.profile import load_profile  # noqa: E402
@@ -101,6 +107,8 @@ def render_rec(item, *, hero: bool = False, key_prefix: str = "") -> None:
         st.markdown(f"<div class='rec-title'>{item.title}{year}</div>", unsafe_allow_html=True)
 
         meta = []
+        if item.director:
+            meta.append(f"dir. {item.director}")
         if item.runtime:
             meta.append(f"{item.runtime} min")
         if item.genres:
@@ -109,6 +117,8 @@ def render_rec(item, *, hero: bool = False, key_prefix: str = "") -> None:
             meta.append(f"TMDB {item.tmdb_rating:.1f}")
         if item.imdb_rating:
             meta.append(f"IMDb {item.imdb_rating:.1f}")
+        if item.your_rating is not None:
+            meta.append(f"you rated it {item.your_rating:g}/5")
         if item.on_watchlist:
             meta.append("★ on your watchlist")
         st.markdown(
@@ -137,26 +147,34 @@ def render_rec(item, *, hero: bool = False, key_prefix: str = "") -> None:
             if pills:
                 st.markdown(pills, unsafe_allow_html=True)
 
-        b = st.columns([1, 1, 1, 1, 3])
+        # No thumbs-up. What it did to the recommendations was never legible -
+        # ratings and reviews are the signal the taste model is actually built
+        # from, and a button that looks like it teaches the model but does not
+        # is worse than no button. The remaining two say exactly what they do.
+        b = st.columns([1.3, 1, 0.9, 0.9, 1.2, 2])
         eng = engine()
         with b[0]:
-            if st.button("👍", key=f"{key_prefix}up{item.tmdb_id}", help="More like this"):
-                eng.record_feedback(item.tmdb_id, "like", "ui")
-                st.toast(f"Noted — more like {item.title}")
-        with b[1]:
             if st.button(
-                "👎", key=f"{key_prefix}dn{item.tmdb_id}", help="Not for me — hide for 60 days"
+                "Not interested",
+                key=f"{key_prefix}dn{item.tmdb_id}",
+                help="Hide this film from recommendations for 60 days",
             ):
                 eng.record_feedback(item.tmdb_id, "dislike", "ui")
-                st.toast(f"Hidden: {item.title}")
+                st.toast(f"Snoozed for 60 days: {item.title}")
                 st.rerun()
-        with b[2]:
+        with b[1]:
             if st.button("Seen it", key=f"{key_prefix}sn{item.tmdb_id}"):
                 eng.record_feedback(item.tmdb_id, "watched", "ui")
                 st.toast("Marked as seen")
                 st.rerun()
-        with b[3]:
+        with b[2]:
             st.link_button("TMDB", item.tmdb_url)
+        with b[3]:
+            if item.imdb_url:
+                st.link_button("IMDb", item.imdb_url)
+        with b[4]:
+            if item.letterboxd_url:
+                st.link_button("Letterboxd", item.letterboxd_url)
 
         with st.expander("Why this surfaced"):
             st.caption("Retrieval sources: " + ", ".join(item.sources))
@@ -250,20 +268,26 @@ with tab_tonight:
             with right:
                 reroll = st.button("🎲 Reroll", width="stretch")
 
-            if reroll or "tonight" not in st.session_state:
-                st.session_state["tonight_seen"] = (
-                    st.session_state.get("tonight_seen", set()) if reroll else set()
-                )
-                with st.spinner("Thinking about what you'd actually enjoy…"):
-                    result = eng.recommend(
-                        "", n=5, exclude=st.session_state.get("tonight_seen", set()), explain=True
-                    )
-                st.session_state["tonight"] = result
-                st.session_state["tonight_seen"] = st.session_state.get("tonight_seen", set()) | {
-                    i.tmdb_id for i in result.items
-                }
+            # The pick is stored in the database, not in the browser session,
+            # so reloading the page or restarting the server shows the same
+            # films instead of spending a Claude call to recompute an identical
+            # answer. It changes when the data changes, or when Reroll is
+            # pressed - and nothing else.
+            conn_t = get_conn(str(cfg.db_path))
+            signature = picks_signature(conn_t)
+            stored = load_picks(conn_t, signature)
 
-            result = st.session_state.get("tonight")
+            if stored is not None and not reroll:
+                result, _ = stored
+            else:
+                # Reroll keeps the films already shown out of the running, so
+                # pressing it repeatedly works through the shortlist rather
+                # than returning the same eight.
+                seen = set(stored[1]) if (stored and reroll) else set()
+                with st.spinner("Thinking about what you'd actually enjoy…"):
+                    result = eng.recommend("", n=5, exclude=seen, explain=True)
+                seen |= {i.tmdb_id for i in result.items}
+                save_picks(conn_t, signature, result, sorted(seen))
             if result and result.items:
                 render_rec(result.items[0], hero=True, key_prefix="t0")
                 if len(result.items) > 1:
@@ -644,7 +668,11 @@ with tab_data:
                 cols = st.columns([3, 3, 1.4, 1.2])
                 cols[0].markdown(f"**{r['title']}** ({r['year']})")
                 if r["tmdb_id"]:
-                    cols[1].markdown(f"matched → {r['matched_title']} ({r['matched_year']})")
+                    kind = " · TV" if r["matched_media_type"] == "tv" else ""
+                    cols[1].markdown(
+                        f"matched → {r['matched_title'] or '(details not fetched yet)'} "
+                        f"({r['matched_year'] or '—'}){kind}"
+                    )
                 else:
                     cols[1].markdown("_no match found_")
                 conf = r["match_confidence"]
@@ -652,21 +680,44 @@ with tab_data:
                 with cols[3]:
                     with st.popover("Fix"):
                         st.caption(f"`{r['film_key']}`")
-                        new_id = st.number_input(
-                            "TMDB id",
-                            min_value=0,
-                            step=1,
-                            key=f"fx{r['film_key']}",
-                            value=int(r["tmdb_id"] or 0),
-                        )
-                        cc = st.columns(2)
-                        if cc[0].button("Pin", key=f"pin{r['film_key']}"):
-                            set_override(conn, r["film_key"], int(new_id) or None, "set from UI")
-                            conn.commit()
-                            bump_cache()
-                            st.rerun()
-                        if cc[1].button(
-                            "Confirm", key=f"ok{r['film_key']}", help="Accept the current match"
+                        # A form, because a plain text_input next to a plain
+                        # button hands the click to Streamlit before the typed
+                        # value is committed: pasting an id and pressing Pin
+                        # submitted the *old* value. A form gathers its widgets
+                        # on submit, which is the only reliable ordering.
+                        with st.form(key=f"form{r['film_key']}", border=False):
+                            ref = st.text_input(
+                                "TMDB link or id",
+                                key=f"fx{r['film_key']}",
+                                placeholder="https://www.themoviedb.org/tv/259265-… or 259265",
+                                help=(
+                                    "Paste the whole TMDB address. A /tv/ link is understood as a "
+                                    "show; a bare number is read as a film."
+                                ),
+                            )
+                            submitted = st.form_submit_button("Pin this id")
+                        if submitted:
+                            parsed = parse_tmdb_reference(ref)
+                            if parsed is None:
+                                # Never silently clear the match: writing a null
+                                # override pinned the film to "no match found"
+                                # permanently and re-applied on every run.
+                                st.error("No TMDB id in that. Paste the link or the number.")
+                            else:
+                                media_type, source = parsed
+                                set_override(
+                                    conn,
+                                    r["film_key"],
+                                    internal_id(media_type, source),
+                                    f"set from UI ({media_type}/{source})",
+                                )
+                                conn.commit()
+                                bump_cache()
+                                st.rerun()
+                        if r["tmdb_id"] and st.button(
+                            "Confirm current match",
+                            key=f"ok{r['film_key']}",
+                            help="Accept the match shown and stop asking",
                         ):
                             set_override(conn, r["film_key"], r["tmdb_id"], "confirmed in UI")
                             conn.commit()

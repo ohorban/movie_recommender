@@ -365,3 +365,38 @@ CREATE TABLE enrichment_attempts (
 CREATE INDEX idx_enrichment_source ON enrichment_attempts(source, last_attempt);
 """,
 )
+
+
+_add(
+    3,
+    "television",
+    """
+-- Letterboxd logs television alongside film, but TMDB keeps movies and shows in
+-- separate id namespaces, so `/movie/1399` and `/tv/1399` are different titles.
+-- Every table here is keyed on `movies.tmdb_id`, so shows are stored with their
+-- TMDB id shifted by TV_ID_OFFSET and the original kept in `source_tmdb_id`.
+-- Shifting is far less invasive than making (id, media_type) the key of a dozen
+-- tables, and TMDB movie ids are six figures with a lot of headroom below 10^7.
+ALTER TABLE movies ADD COLUMN media_type TEXT NOT NULL DEFAULT 'movie';
+ALTER TABLE movies ADD COLUMN source_tmdb_id INTEGER;
+UPDATE movies SET source_tmdb_id = tmdb_id WHERE source_tmdb_id IS NULL;
+CREATE INDEX idx_movies_media_type ON movies(media_type);
+
+-- The manual-match UI used to write a NULL override when its number field had
+-- not been committed, which pinned the film to "no match found" permanently and
+-- made it un-fixable: the override was reapplied on every run. Clear those.
+DELETE FROM title_overrides WHERE tmdb_id IS NULL;
+UPDATE user_films
+   SET match_method = NULL, match_confidence = NULL, needs_review = 1, resolved_at = NULL
+ WHERE tmdb_id IS NULL AND match_method = 'override';
+
+-- Everything still awaiting review was matched by a version that could not see
+-- television and that read a one-year release-date disagreement as evidence
+-- against an otherwise identical title. Both are fixed, so those films get
+-- another pass. Only unconfirmed ones: a match the user accepted by hand
+-- stands, and no confident match is discarded here.
+UPDATE user_films
+   SET tmdb_id = NULL, match_confidence = NULL, resolved_at = NULL
+ WHERE needs_review = 1 AND COALESCE(match_method, '') != 'override';
+""",
+)
