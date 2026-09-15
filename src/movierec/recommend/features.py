@@ -24,6 +24,18 @@ from ..taste.profile import TasteProfile, affinity_value, load_movie_facets, run
 
 log = get_logger("recommend.features")
 
+# Bumped whenever a feature's *meaning* changes, not just its name. A stored
+# model's coefficients are only valid for the feature set they were fitted on,
+# and a renamed-in-place feature (scale_fit went from a distance-to-target to a
+# signed, centred score) would otherwise have stale weights applied to it
+# silently. `TasteRanker.load` refuses a model from a different version.
+FEATURE_VERSION = 2
+
+# How fast cf_score saturates, against the total preference the user has
+# expressed. Chosen so a film adjacent to a good share of their favourites
+# lands in the middle of the range rather than pinning to 1.0.
+CF_SHARPNESS = 6.0
+
 FEATURE_NAMES = [
     "sim_mode_best",
     "sim_mode_weighted",
@@ -160,9 +172,13 @@ class FeatureBuilder:
                     scores[nb] += float(r["score"]) * self._liked[r["tmdb_id"]]
         if not scores:
             return {}
-        # Squash into 0-1 so a film adjacent to many favourites cannot dominate.
-        peak = max(scores.values()) or 1.0
-        return {k: math.tanh(2.0 * v / peak) for k, v in scores.items()}
+        # Normalised against the user's own evidence, not against the batch.
+        # Dividing by the batch peak made a film's score depend on what else
+        # happened to be scored beside it - the same film moved from 0.82 in the
+        # full catalog to 0.96 in a 200-film shortlist - and trained the ranker
+        # on ~160-film batches for use on batches of thousands.
+        scale = sum(self._liked.values()) or 1.0
+        return {k: math.tanh(CF_SHARPNESS * v / scale) for k, v in scores.items()}
 
     def _prepare_loo(self, prefs: dict[int, float]) -> None:
         """Rebuild the unnormalised centroid sums so a film can be removed from its own.
@@ -239,18 +255,31 @@ class FeatureBuilder:
         return float((num / den - PRIOR_SCORE) / 1.6)
 
     def _scale_fit(self, dossier: dict[str, Any] | None) -> float:
-        if not dossier or not self.profile.scale_targets:
+        """How far this film leans the way the viewer's ratings lean.
+
+        Centred on zero: positive means the film is further than average in the
+        direction this viewer rewards, negative means the other way. That makes
+        the absent-dossier case honest - only 1.5% of the catalog has one, and
+        the old sentinel of 0.0 sat *below* the worst real fit (the score could
+        not go negative), so a missing dossier was a penalty of about six
+        standard deviations and having one was effectively a bonus. Since
+        dossiers are generated for films the recommender already picked, that
+        was a feedback loop.
+        """
+        if not dossier or not self.profile.scale_weights:
             return 0.0
         scales = dossier.get("scales") or {}
         num = den = 0.0
         for name in DOSSIER_SCALES:
-            target = self.profile.scale_targets.get(name)
             weight = self.profile.scale_weights.get(name, 0.0)
             value = scales.get(name)
-            if target is None or value is None or weight <= 0.01:
+            if value is None or abs(weight) <= 0.01:
                 continue
-            num += weight * (1.0 - 2.0 * abs(float(value) - float(target)))
-            den += weight
+            pivot = self.profile.scale_pivots.get(name, 0.5)
+            # Signed weight times signed displacement: agreeing with the
+            # direction the viewer rewards scores positive either way round.
+            num += weight * (float(value) - float(pivot)) * 2.0
+            den += abs(weight)
         return float(num / den) if den > 0 else 0.0
 
     def _aff(self, facet: str, value: str, loo_pref: float | None) -> float:
@@ -327,13 +356,22 @@ class FeatureBuilder:
             # back to the profile similarity keeps the feature comparable rather
             # than penalising every film that lacks an article.
             pvec = plot_vecs.get(tmdb_id)
-            if pvec is not None and self.mode_matrix.shape[0]:
-                sim_plot = float((self.mode_matrix @ pvec).max())
+            if pvec is not None and modes.shape[0]:
+                # `modes`, not `self.mode_matrix`: the leave-one-out matrix built
+                # above. Using the full one here scored a training film's plot
+                # against centroids that still contained the film itself, which
+                # is the leak `sim_mode_best` three lines up is careful to avoid.
+                sim_plot = float((modes @ pvec).max())
             else:
                 sim_plot = sim_best
-            sim_dislike = (
-                float(self.dislike @ vec) if (self.dislike is not None and vec is not None) else 0.0
-            )
+
+            # Same correction on the dislike side. `_loo_dislike` existed but was
+            # never called, so every one of the films inside the dislike centroid
+            # was being compared against a centroid containing itself.
+            dislike = self.dislike
+            if loo_pref is not None and vec is not None:
+                dislike = self._loo_dislike(tmdb_id, vec)
+            sim_dislike = float(dislike @ vec) if (dislike is not None and vec is not None) else 0.0
 
             values = {
                 "sim_mode_best": sim_best,

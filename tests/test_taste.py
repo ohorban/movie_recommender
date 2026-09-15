@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import random
+
+import pytest
+
 from movierec.taste.profile import (
     aggregate_review_facts,
     compute_affinities,
@@ -102,13 +106,38 @@ def test_review_aggregation_handles_empty():
 def test_scale_preferences_needs_enough_evidence():
     prefs = dict.fromkeys(range(5), 0.5)
     dossiers = {i: {"scales": {"darkness": 0.5}} for i in range(5)}
-    assert scale_preferences(prefs, dossiers) == ({}, {})
+    assert scale_preferences(prefs, dossiers) == ({}, {}, {})
 
 
 def test_scale_preferences_finds_a_correlated_dimension():
     # Preference tracks darkness exactly: the weight should be high.
     prefs = {i: (i / 20.0) - 0.5 for i in range(20)}
     dossiers = {i: {"scales": {"darkness": i / 20.0, "humor": 0.5}} for i in range(20)}
-    targets, weights = scale_preferences(prefs, dossiers)
-    assert weights["darkness"] > weights.get("humor", 0.0)
+    targets, weights, pivots = scale_preferences(prefs, dossiers)
+    assert weights["darkness"] > abs(weights.get("humor", 0.0))
     assert targets["darkness"] > 0.5, "they prefer the darker end, so the target should sit high"
+    assert pivots["darkness"] == pytest.approx(0.475, abs=0.01)
+
+
+def test_a_scale_the_viewer_dislikes_gets_a_negative_weight():
+    """The sign is the whole point.
+
+    With `abs(r)` a viewer who likes *less* darkness was indistinguishable from
+    one who likes more, and the ranking feature - a distance from the target -
+    could only ever say "about average is best". On real data that made the
+    feature correlate -0.02 with preference where the signed form reaches +0.44.
+    """
+    prefs = {i: 0.5 - (i / 20.0) for i in range(20)}
+    dossiers = {i: {"scales": {"darkness": i / 20.0}} for i in range(20)}
+    _targets, weights, _pivots = scale_preferences(prefs, dossiers)
+    assert weights["darkness"] < 0
+
+
+def test_a_scale_uncorrelated_with_preference_is_dropped():
+    """Below the noise floor it is sampling error, and it used to be injected
+    into every candidate's score - `darkness` cleared the old gate at r=0.027."""
+    rng = random.Random(7)
+    prefs = {i: rng.uniform(-1, 1) for i in range(40)}
+    dossiers = {i: {"scales": {"darkness": 0.5 + 1e-9 * i}} for i in range(40)}
+    _targets, weights, _pivots = scale_preferences(prefs, dossiers)
+    assert weights.get("darkness", 0.0) == 0.0

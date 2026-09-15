@@ -142,12 +142,31 @@ def aspect_table(profile: TasteProfile) -> pd.DataFrame:
 
 
 def scale_table(profile: TasteProfile) -> pd.DataFrame:
-    rows = [
-        {"scale": k, "your_sweet_spot": v, "how_much_it_matters": profile.scale_weights.get(k, 0.0)}
-        for k, v in profile.scale_targets.items()
-    ]
+    """Where the viewer's liked films sit on each axis, and which way they lean.
+
+    `scale_weights` is signed, so the direction is shown as its own column
+    rather than being lost to an absolute value.
+    """
+    columns = ["scale", "your_sweet_spot", "you_prefer", "how_much_it_matters"]
+    rows = []
+    for k, v in profile.scale_targets.items():
+        weight = profile.scale_weights.get(k, 0.0)
+        if weight > 0:
+            direction = "more of it"
+        elif weight < 0:
+            direction = "less of it"
+        else:
+            direction = "no clear preference"
+        rows.append(
+            {
+                "scale": k,
+                "your_sweet_spot": v,
+                "you_prefer": direction,
+                "how_much_it_matters": abs(weight),
+            }
+        )
     if not rows:
-        return pd.DataFrame(columns=["scale", "your_sweet_spot", "how_much_it_matters"])
+        return pd.DataFrame(columns=columns)
     return (
         pd.DataFrame(rows)
         .sort_values("how_much_it_matters", ascending=False)

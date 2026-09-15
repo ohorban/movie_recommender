@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -203,3 +205,170 @@ def test_the_spread_survives_a_save_and_load(conn):
     assert restored is not None
     assert restored.metrics.spearman_sd == pytest.approx(0.031)
     assert restored.metrics.cv_repeats == 5
+
+
+# --------------------------------------------------------------------------- #
+# Choosing what to deploy
+# --------------------------------------------------------------------------- #
+# With ~160 ratings the learned models and the hand-tuned prior are usually
+# within noise of each other. Ridge once won by 0.0015 Spearman (paired
+# p = 0.91) and, because the weight was derived by dividing that score by a
+# constant and clipping, the coin flip did not tilt the blend — it set the
+# weight to 1.0 and switched the prior off entirely.
+def _split_scores(name_to_splits, **extra):
+    return {
+        name: {
+            "spearman": float(np.mean(splits)),
+            "sd": float(np.std(splits)),
+            "ndcg_at_10": 0.8,
+            "mae": 0.7,
+            "repeats": len(splits),
+            "per_split": list(splits),
+            **extra,
+        }
+        for name, splits in name_to_splits.items()
+    }
+
+
+def test_a_learned_model_that_wins_by_noise_does_not_replace_the_prior():
+    fm, y = make_fm(160)
+    # Ridge is ahead on average but loses on two of the five splits: the paired
+    # difference is well inside its own standard error.
+    scores = _split_scores(
+        {
+            "heuristic": [0.521, 0.515, 0.525, 0.502, 0.483],
+            "ridge": [0.522, 0.476, 0.560, 0.513, 0.484],
+        }
+    )
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores)
+    assert ranker.metrics.model_kind == "heuristic"
+    assert ranker.metrics.blend_weight == 0.0
+
+
+def test_a_consistent_winner_still_replaces_the_prior():
+    """The guard must not be so strict that nothing can ever be learned."""
+    fm, y = make_fm(160)
+    scores = _split_scores(
+        {
+            "heuristic": [0.30, 0.31, 0.29, 0.30, 0.32],
+            "ridge": [0.48, 0.49, 0.47, 0.50, 0.48],
+        }
+    )
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores)
+    assert ranker.metrics.model_kind == "ridge"
+
+
+def test_beating_a_useless_prior_is_not_evidence_of_skill():
+    """On random ratings the prior scores about zero, so clearing it proves
+    nothing. A learned model has to be worth something in absolute terms."""
+    fm, y = make_fm(160)
+    scores = _split_scores(
+        {
+            "heuristic": [-0.06, -0.04, -0.07, -0.05, -0.05],
+            "ridge": [0.13, 0.12, 0.14, 0.13, 0.13],
+        }
+    )
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores)
+    assert ranker.metrics.model_kind == "heuristic"
+    assert ranker.metrics.blend_weight == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# The blend weight
+# --------------------------------------------------------------------------- #
+def _blend_grid(by_weight):
+    return {"ridge": {w: [(s, 0.8, 0.7)] * 5 for w, s in by_weight.items()}}
+
+
+def test_the_blend_weight_comes_from_the_held_out_search():
+    """Neither component's own score says anything about the mixture.
+
+    On real data ridge lost to the prior alone and a mix of the two beat both,
+    which the old rule — divide the winner's Spearman by 0.45 and clip — could
+    not express: above 0.45 everything saturated, so the only reachable weights
+    were 0.0 and 1.0 and the blend was never actually blended.
+    """
+    fm, y = make_fm(160)
+    scores = _split_scores(
+        {"heuristic": [0.548] * 5, "ridge": [0.511] * 5},
+    )
+    grid = _blend_grid({0.0: 0.548, 0.2: 0.585, 0.4: 0.580, 0.6: 0.560, 0.8: 0.535, 1.0: 0.511})
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores, blend_scores=grid)
+    assert ranker.metrics.model_kind == "ridge"
+    assert ranker.metrics.blend_weight == pytest.approx(0.2)
+    assert ranker.metrics.spearman == pytest.approx(0.585), (
+        "the reported score must describe the mixture that ships, not one component"
+    )
+    assert ranker.metrics.blend_spearman == pytest.approx(0.585)
+
+
+def test_a_flat_peak_keeps_more_of_the_prior():
+    """Taking the argmax of eleven correlated estimates flatters itself."""
+    fm, y = make_fm(160)
+    scores = _split_scores({"heuristic": [0.548] * 5, "ridge": [0.511] * 5})
+    grid = _blend_grid({0.0: 0.548, 0.2: 0.5600, 0.4: 0.5607, 0.6: 0.552, 1.0: 0.511})
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores, blend_scores=grid)
+    assert ranker.metrics.blend_weight == pytest.approx(0.2), (
+        "0.0007 is not a reason to trade away the prior"
+    )
+
+
+def test_a_mixture_that_does_not_beat_the_prior_is_refused():
+    fm, y = make_fm(160)
+    scores = _split_scores({"heuristic": [0.548] * 5, "ridge": [0.511] * 5})
+    grid = _blend_grid({0.0: 0.548, 0.2: 0.5495, 0.5: 0.545, 1.0: 0.511})
+    ranker = TasteRanker.fit(fm, y, oof_scores=scores, blend_scores=grid)
+    assert ranker.metrics.model_kind == "heuristic"
+    assert ranker.metrics.blend_weight == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Reporting what is actually running
+# --------------------------------------------------------------------------- #
+def test_a_model_fitted_on_a_different_feature_set_is_refused(conn):
+    """Stale coefficients must never be applied to redefined features.
+
+    `scale_fit` changed meaning without changing name, so matching on names
+    alone would have kept applying weights fitted for the old definition.
+    """
+    from movierec.db import fetch_all
+
+    fm, y = make_fm(160)
+    scores = _split_scores({"heuristic": [0.2] * 5, "ridge": [0.6] * 5})
+    TasteRanker.fit(fm, y, oof_scores=scores).save(conn)
+    assert TasteRanker.load(conn)._model is not None, "the fixture needs a learned model"
+
+    row = fetch_all(conn, "SELECT payload_json FROM model_artifacts WHERE is_active=1")[0]
+    payload = json.loads(row["payload_json"])
+    payload["feature_version"] = 999
+    conn.execute(
+        "UPDATE model_artifacts SET payload_json = ? WHERE is_active = 1", (json.dumps(payload),)
+    )
+
+    restored = TasteRanker.load(conn)
+    assert restored._model is None
+    assert restored.metrics.model_kind == "heuristic"
+    assert restored.metrics.blend_weight == 0.0
+
+
+def test_an_unusable_model_reports_the_prior_that_is_actually_serving(conn):
+    """It used to keep reporting "ridge, spearman 0.51" while the heuristic did
+    all the ranking — a number for a model that was not running."""
+    from movierec.db import fetch_all
+
+    fm, y = make_fm(160)
+    scores = _split_scores({"heuristic": [0.2] * 5, "ridge": [0.6] * 5})
+    TasteRanker.fit(fm, y, oof_scores=scores).save(conn)
+
+    row = fetch_all(conn, "SELECT payload_json FROM model_artifacts WHERE is_active=1")[0]
+    payload = json.loads(row["payload_json"])
+    payload["model_pickle_b64"] = "bm90IGEgcGlja2xl"  # decodes, does not unpickle
+    conn.execute(
+        "UPDATE model_artifacts SET payload_json = ? WHERE is_active = 1", (json.dumps(payload),)
+    )
+
+    restored = TasteRanker.load(conn)
+    assert restored._model is None
+    assert restored.metrics.model_kind == "heuristic"
+    assert restored.metrics.spearman == 0.0, "do not quote a score for a model that cannot run"
+    assert restored.metrics.top_features, "the prior's own weights should be shown instead"

@@ -31,6 +31,43 @@ log = get_logger("taste.training")
 # second); five of them turn a figure that bounces by 0.07 into a stable one.
 CV_SEEDS = (17, 23, 42, 99, 7)
 
+# How much of the learned model to mix into the prior. Searched on the held-out
+# folds rather than derived from a constant: the previous rule divided the
+# Spearman by 0.45, which saturates to 1.0 for any score above that and so could
+# only ever produce 0.0 or 1.0 — the blend was never actually blended. On real
+# data the best mix was near the middle and worth +0.034 Spearman over either
+# model alone.
+BLEND_GRID = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+
+
+def _zscore(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    spread = float(values.std())
+    return (values - values.mean()) / (spread if spread > 1e-9 else 1.0)
+
+
+def _fold_metrics(
+    y: np.ndarray, predictions: np.ndarray, fold_of: np.ndarray
+) -> tuple[float, float, float]:
+    """Score each fold on its own, then average.
+
+    Correlating the concatenated out-of-fold vector instead lets the offset
+    between folds - each has its own model and its own rebuilt profile - into
+    the metric. On real data that artifact was 0.017 Spearman, more than ten
+    times the margin it was being used to decide.
+    """
+    spearman, ndcg, mae = [], [], []
+    for fold in sorted({int(f) for f in fold_of if f >= 0}):
+        rows = fold_of == fold
+        if rows.sum() < 3:
+            continue
+        spearman.append(_spearman(y[rows], predictions[rows]))
+        ndcg.append(_ndcg_at_k(y[rows], predictions[rows], 10))
+        mae.append(float(np.abs(y[rows] - predictions[rows]).mean()))
+    if not spearman:
+        return 0.0, 0.0, 0.0
+    return float(np.mean(spearman)), float(np.mean(ndcg)), float(np.mean(mae))
+
 
 def _fold_predictions(
     conn: sqlite3.Connection,
@@ -40,8 +77,13 @@ def _fold_predictions(
     *,
     n_splits: int = 5,
     seed: int = 17,
-) -> dict[str, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """Honest out-of-fold predictions, rebuilding the taste profile per fold.
+
+    Returns the predictions per model and the fold each row was held out in,
+    because a metric has to be computed *within* a fold: each fold has its own
+    model and its own rebuilt profile, so correlating the concatenation of all
+    five lets the offsets between folds into the number.
 
     This is the only way to get a trustworthy number out of this system. The
     features are not raw measurements - affinities, taste centroids and scale
@@ -64,8 +106,12 @@ def _fold_predictions(
     names = ["heuristic", *TasteRanker.candidate_models(int(n * (1 - 1 / n_splits))).keys()]
     oof = {name: np.zeros(n, dtype=np.float64) for name in names}
 
+    fold_of = np.full(n, -1, dtype=np.int64)
+    failed: set[str] = set()
+
     folds = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for train_idx, test_idx in folds.split(ids):
+    for fold_no, (train_idx, test_idx) in enumerate(folds.split(ids)):
+        fold_of[test_idx] = fold_no
         train_ids = [int(i) for i in ids[train_idx]]
         test_ids = [int(i) for i in ids[test_idx]]
         fold_prefs = {i: prefs[i] for i in train_ids}
@@ -89,9 +135,15 @@ def _fold_predictions(
                 model.fit(fm_train.matrix.astype(np.float64), y[train_idx])
                 oof[name][test_idx] = model.predict(fm_test.matrix.astype(np.float64))
             except Exception as exc:
-                log.warning("fold fit failed for %s: %s", name, exc)
-                oof[name][test_idx] = 0.0
-    return oof
+                # Imputing a constant here used to look like a small loss of
+                # accuracy rather than a broken run: zero sits near the mean of
+                # a z-scored target, so the dead fold landed mid-pack and cost
+                # about 0.06 Spearman quietly. Drop the model instead.
+                log.warning("fold fit failed for %s: %s — excluding it from this split", name, exc)
+                failed.add(name)
+    for name in failed:
+        oof.pop(name, None)
+    return oof, fold_of
 
 
 def train_ranker(
@@ -131,41 +183,55 @@ def train_ranker(
     ids = list(prefs.keys())
     targets = np.array([prefs[i] for i in ids], dtype=np.float64)
 
-    oof_scores: dict[str, dict[str, float]] | None = None
+    oof_scores: dict[str, dict[str, Any]] | None = None
+    blend_scores: dict[str, dict[float, list[float]]] | None = None
     if len(prefs) >= MIN_TRAINING_ROWS:
-        try:
-            # Repeated k-fold. A single split of ~160 ratings produces a score
-            # that swings by about 0.07 run to run on identical data, which
-            # reads as a regression when nothing has changed. Each split is
-            # scored on its own and the metrics are averaged — not the
-            # predictions, which would measure an ensemble of fold models
-            # rather than the single model actually deployed.
-            sorted_ids = sorted(prefs.keys())
-            y_sorted = np.array([prefs[int(i)] for i in sorted_ids])
-            per_split: dict[str, list[tuple[float, float, float]]] = {}
-            for seed in CV_SEEDS:
-                run = _fold_predictions(conn, backend, prefs, titles, seed=seed)
+        # Deliberately not wrapped in a try/except. This used to fall back to an
+        # in-sample cross-validation on a transient failure, which reports about
+        # 0.89 where the honest figure is 0.51 — and then stored that as the
+        # model's accuracy. A broken evaluation must be visible, not flattering.
+        sorted_ids = sorted(prefs.keys())
+        y_sorted = np.array([prefs[int(i)] for i in sorted_ids])
+        per_split: dict[str, list[tuple[float, float, float]]] = {}
+        blend_split: dict[str, dict[float, list[float]]] = {}
+
+        for seed in CV_SEEDS:
+            run, fold_of = _fold_predictions(conn, backend, prefs, titles, seed=seed)
+            for name, predictions in run.items():
+                per_split.setdefault(name, []).append(_fold_metrics(y_sorted, predictions, fold_of))
+            # How good is the blend that actually ships? The deployed scorer is
+            # `w * learned_z + (1 - w) * heuristic_z`, and neither component's
+            # own score says anything about the mixture - on this data the best
+            # mix beat both of them. So it is measured directly, on the same
+            # folds, for every candidate model and every weight. Standardisation
+            # uses only the predictions, never the targets, so it stays honest.
+            if "heuristic" in run:
+                heur_z = _zscore(run["heuristic"])
                 for name, predictions in run.items():
-                    per_split.setdefault(name, []).append(
-                        (
-                            _spearman(y_sorted, predictions),
-                            _ndcg_at_k(y_sorted, predictions, 10),
-                            float(np.abs(y_sorted - predictions).mean()),
-                        )
-                    )
-            oof_scores = {
-                name: {
-                    "spearman": float(np.mean([v[0] for v in vals])),
-                    "sd": float(np.std([v[0] for v in vals])),
-                    "ndcg_at_10": float(np.mean([v[1] for v in vals])),
-                    "mae": float(np.mean([v[2] for v in vals])),
-                    "repeats": len(vals),
-                }
-                for name, vals in per_split.items()
+                    if name == "heuristic":
+                        continue
+                    learned_z = _zscore(predictions)
+                    grid = blend_split.setdefault(name, {w: [] for w in BLEND_GRID})
+                    for w in BLEND_GRID:
+                        mixed = w * learned_z + (1.0 - w) * heur_z
+                        grid[w].append(_fold_metrics(y_sorted, mixed, fold_of))
+
+        oof_scores = {
+            name: {
+                "spearman": float(np.mean([v[0] for v in vals])),
+                "sd": float(np.std([v[0] for v in vals])),
+                "ndcg_at_10": float(np.mean([v[1] for v in vals])),
+                "mae": float(np.mean([v[2] for v in vals])),
+                "repeats": len(vals),
+                # Kept per split so the choice between models can be a paired
+                # comparison rather than a comparison of two averages.
+                "per_split": [float(v[0]) for v in vals],
             }
-        except Exception as exc:
-            log.warning("held-out evaluation failed (%s); falling back to in-sample CV", exc)
-            oof_scores = None
+            for name, vals in per_split.items()
+        }
+        blend_scores = {
+            name: {w: v for w, v in grid.items() if v} for name, grid in blend_split.items()
+        }
 
     builder = FeatureBuilder(conn, profile, embed_model=backend.name)
     builder.set_reference_prefs(prefs)
@@ -177,7 +243,7 @@ def train_ranker(
     for row, tmdb_id in enumerate(fm.ids):
         fm.matrix[row, cf_idx] = max(0.0, float(fm.matrix[row, cf_idx]) - self_cf.get(tmdb_id, 0.0))
 
-    ranker = TasteRanker.fit(fm, targets, oof_scores=oof_scores)
+    ranker = TasteRanker.fit(fm, targets, oof_scores=oof_scores, blend_scores=blend_scores)
     if store:
         ranker.save(conn)
     return ranker

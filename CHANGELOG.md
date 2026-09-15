@@ -39,6 +39,31 @@ manual migration step*, and is always called out explicitly.
 
 ### Fixed
 
+- **Two leakage holes.** `_loo_dislike` was defined and never called, so every film inside the
+  dislike centroid was compared against a centroid containing itself — and `sim_dislike` is one of
+  the largest weights in the model. `sim_plot_best` reached for the full mode matrix while
+  `sim_mode_best`, three lines above, used the leave-one-out one.
+- **The stored profile is no longer a lossy copy of the trained one.** Affinities were truncated to
+  the 80 largest per facet, which — because the largest values are the ones with a single
+  observation behind them — kept the noise and discarded the evidence, and `affinity_stats` was
+  never persisted at all, so leave-one-out silently did nothing on a profile read back from the
+  database. Both are stored in full now, along with mode membership.
+- **The taste profile is reproducible.** The ratings query had no `ORDER BY` and k-means++ seeds
+  from row order, so identical ratings could produce different taste modes — and each mode drives
+  its own retrieval neighbourhood. Cluster labels also depended on dict ordering, so the same
+  cluster was described differently from run to run in the UI and in the prompt sent to Claude.
+- **A failed fold no longer degrades the score quietly.** It imputed a constant 0.0, which sits near
+  the mean of a z-scored target, so a broken fold landed mid-pack and cost about 0.06 Spearman with
+  only a log line. The model is now dropped from that split instead.
+- **A failed held-out evaluation no longer falls back to a flattering number.** The fallback ran an
+  in-sample cross-validation reporting about 0.89 where the honest figure is 0.51, and stored that
+  as the model's accuracy. It now fails loudly.
+- **A model that cannot be loaded no longer reports itself as running.** An unusable pickle kept
+  reporting "ridge, spearman 0.51" while the heuristic did all the ranking. Feature sets are also
+  versioned now, so coefficients fitted on an older definition are refused rather than applied to a
+  feature that changed meaning underneath them.
+
+
 - **Correcting a bad match silently did nothing.** Two independent faults. The id typed into the
   Fix box never reached the handler, because a plain widget beside a plain button hands Streamlit
   the click before the typed value commits — so the old value was submitted. The handler then
@@ -82,6 +107,39 @@ manual migration step*, and is always called out explicitly.
 
 ### Changed
 
+- **The ranking model is no longer chosen by a coin flip.** Ridge had replaced the hand-tuned prior
+  outright on a held-out margin of 0.0015 Spearman (paired *p* = 0.91), and because the trust weight
+  was `score / 0.45` clipped to 1.0, that coin flip did not tilt the blend — it switched the prior
+  off entirely. A learned model now has to beat the prior by more than a standard error of the
+  paired per-split difference, *and* clear an absolute skill floor: on random ratings the prior
+  scores about zero, so merely clearing it proves nothing.
+- **Held-out metrics are computed within each fold, then averaged.** Correlating the concatenated
+  out-of-fold vector let the offsets between folds — each has its own model and its own rebuilt
+  profile — into the number. That artifact was worth 0.017 Spearman, more than ten times the margin
+  it was being used to decide, and it was the whole reason ridge appeared to win.
+- **The blend weight is searched on held-out folds instead of derived from a constant.** Dividing by
+  0.45 and clipping meant only 0.0 and 1.0 were ever reachable, so the blend was never blended. The
+  search covers which model *and* how much of it, with weight zero — the prior alone — competing on
+  the same footing. Ties inside half a point of Spearman go to the smaller weight, because the peak
+  is flat and taking the maximum of eleven correlated estimates flatters itself.
+- **`scale_fit` keeps the direction of a preference.** The weight was `abs(r)` and the feature scored
+  distance from a target, which cannot express "more of this is better" — a viewer who likes
+  spectacle more the more of it there is was modelled as preferring average spectacle. On real data
+  the feature correlated **-0.02** with preference; the signed form reaches **+0.44**. Weights are
+  now signed, scales below a 0.10 correlation are dropped as noise (`darkness` was clearing the old
+  gate at 0.027), and the Insights tab shows the direction as its own column.
+- **A missing dossier is neutral rather than disqualifying.** `scale_fit` returned 0.0 when a film
+  had none, which sat *below* the worst real fit of 0.354 — about six standard deviations low for
+  the 97.7% of candidates without one. Every rated film has a dossier and 2.3% of the candidate pool
+  does, so this was a large systematic bonus for having been recommended before: 9 of the shipped
+  top 20 had a dossier against that 2.3% base rate, and dossiers are generated for films the
+  recommender already picked. The feature is now centred on zero, so absent evidence scores zero.
+- **`cf_score` no longer depends on what else is in the batch.** It was normalised against the peak
+  of the candidate set, so the same film scored 0.818 in the full catalog and 0.964 in a 200-film
+  shortlist — and the ranker was fitted on ~160-film batches for use on batches of thousands. It is
+  now normalised against the user's own expressed preference, which does not move.
+
+
 - **"Why you" no longer justifies one film with another.** It read *"You wrote that Mulan is not
   often a movie that makes me cry, and this is built for exactly that kind of animated gut-punch"* —
   a claim specific enough to be wrong often, and not what a preference is. Explanations are now
@@ -114,6 +172,18 @@ manual migration step*, and is always called out explicitly.
   than it is not a difference.
 
 ### Note
+
+Measured on the real database, held-out Spearman over five fold splits:
+
+```
+before   ridge alone, weight 1.00      0.5221   (what shipped, selected on a 0.0015 margin)
+after    20% ridge + 80% prior         0.5600   (sd 0.0283)
+```
+
+The prior alone now scores 0.5477, up from 0.5269, which is the leakage and `scale_fit` fixes
+showing up in the honest number rather than in the model. The mixture adds a further 0.013 on top
+(paired *p* = 0.12 — real but not conclusive, which is why the tie-break leans toward the prior).
+
 
 The first version of the averaging above averaged the *predictions* across the five splits and
 scored those. That measures a five-model ensemble, not the single model that actually gets deployed,

@@ -15,13 +15,26 @@ import numpy as np
 import pytest
 
 from movierec.db import insert_ignore, upsert
-from movierec.enrich.embeddings import HashBackend, embed_movies
-from movierec.recommend.features import FeatureBuilder
+from movierec.enrich.embeddings import MOVIE, PLOT, HashBackend, embed_movies
+from movierec.recommend.features import FEATURE_NAMES, FeatureBuilder
 from movierec.recommend.ranker import TasteRanker, _spearman
 from movierec.taste.profile import build_profile, preference_scores
 from movierec.taste.training import train_ranker
 
 N_FILMS = 90
+
+
+def _prefs(conn) -> dict[int, float]:
+    """The preference z-scores this fixture's ratings imply."""
+    rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT f.tmdb_id, r.rating, NULL AS liked FROM user_ratings r "
+            "JOIN user_films f USING(film_key)"
+        )
+    ]
+    prefs, _mean, _std = preference_scores(rows)
+    return prefs
 
 
 def _corr(column: np.ndarray, y: np.ndarray) -> float:
@@ -202,3 +215,72 @@ def test_naive_in_sample_cv_would_have_been_fooled(noisy_library):
         "the naive path should look dramatically better than it is — that is the bug"
     )
     assert _spearman(y, np.asarray(y)) == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Leave-one-out has to cover every taste signal, not most of them
+# --------------------------------------------------------------------------- #
+def test_the_dislike_similarity_is_corrected_too(noisy_library):
+    """`_loo_dislike` existed but nothing called it.
+
+    Every film inside the dislike centroid was compared against a centroid
+    that still contained the film itself, and `sim_dislike` is one of the
+    largest weights in the model.
+    """
+    conn, backend = noisy_library
+    profile = build_profile(conn, backend, store=False)
+    if not profile.dislike_member_ids:
+        pytest.skip("this fixture produced no dislike centroid")
+
+    prefs = _prefs(conn)
+    builder = FeatureBuilder(conn, profile, embed_model=backend.name)
+    builder.set_reference_prefs(prefs)
+    members = [i for i in profile.dislike_member_ids if i in prefs]
+    idx = FEATURE_NAMES.index("sim_dislike")
+
+    leaky = builder.build(members)
+    honest = builder.build(members, loo_prefs=prefs)
+    assert not np.allclose(leaky.matrix[:, idx], honest.matrix[:, idx]), (
+        "removing a film from the centroid it belongs to must change its similarity to it"
+    )
+
+
+def test_the_plot_similarity_uses_the_corrected_centroids(noisy_library):
+    """`sim_plot_best` reached for the full mode matrix while `sim_mode_best`
+    three lines above used the leave-one-out one."""
+    conn, backend = noisy_library
+    profile = build_profile(conn, backend, store=False)
+    prefs = _prefs(conn)
+    members = [i for m in profile.modes for i in m.member_ids if i in prefs]
+    assert members, "the fixture should produce taste modes with members"
+
+    # The fixture has no Wikipedia synopses, so nothing has a plot vector and
+    # the branch under test never runs. Give the members one - reusing their
+    # profile vector is enough, since what is being checked is *which* centroid
+    # matrix the similarity is taken against, not what the vector contains.
+    rows = [
+        {
+            "entity_type": PLOT,
+            "entity_id": str(r["entity_id"]),
+            "model": backend.name,
+            "dim": r["dim"],
+            "content_hash": "test-plot",
+            "vector": r["vector"],
+            "updated_at": "2026-01-01 00:00:00",
+        }
+        for r in conn.execute(
+            "SELECT entity_id, dim, vector FROM embeddings WHERE entity_type = ? AND model = ?",
+            (MOVIE, backend.name),
+        )
+    ]
+    upsert(conn, "embeddings", rows, key=["entity_type", "entity_id", "model"])
+
+    builder = FeatureBuilder(conn, profile, embed_model=backend.name)
+    builder.set_reference_prefs(prefs)
+    idx = FEATURE_NAMES.index("sim_plot_best")
+
+    leaky = builder.build(members)
+    honest = builder.build(members, loo_prefs=prefs)
+    assert not np.allclose(leaky.matrix[:, idx], honest.matrix[:, idx]), (
+        "sim_plot_best must be taken against the leave-one-out centroids too"
+    )

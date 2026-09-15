@@ -515,7 +515,12 @@ with tab_insights:
             if ranker:
                 m = ranker.metrics
                 cols = st.columns(4)
-                cols[0].metric("Model", m.model_kind)
+                cols[0].metric(
+                    "Model",
+                    m.model_kind
+                    if m.blend_weight in (0.0, 1.0)
+                    else f"{m.blend_weight:.0%} {m.model_kind} + prior",
+                )
                 cols[1].metric(
                     "Rank correlation",
                     f"{m.spearman:.2f}" + (f" ± {m.spearman_sd:.2f}" if m.spearman_sd else ""),
@@ -533,13 +538,20 @@ with tab_insights:
                 st.progress(
                     min(1.0, m.blend_weight),
                     text=f"Learned model influence: {m.blend_weight:.0%} "
-                    f"(the rest is the hand-tuned prior — this rises as you rate more films)",
+                    f"(the rest is the hand-tuned prior — chosen by testing the mixture itself "
+                    f"on held-out films, not derived from the score)",
                 )
                 if m.model_kind == "heuristic":
                     st.caption(
-                        "No learned model beat the hand-tuned prior on held-out data, so the prior "
-                        "is doing the ranking. This is expected at a few hundred ratings and "
-                        "resolves itself as you rate more."
+                        "No learned model beat the hand-tuned prior on held-out data by more than "
+                        "the run-to-run noise, so the prior is doing the ranking. This is expected "
+                        "at a few hundred ratings and resolves itself as you rate more."
+                    )
+                elif 0.0 < m.blend_weight < 1.0:
+                    st.caption(
+                        "Neither the learned model nor the prior was best on its own — the "
+                        "mixture beat both. The figure above is the mixture's own held-out score, "
+                        "not either half's."
                     )
                 if m.top_features:
                     label = (

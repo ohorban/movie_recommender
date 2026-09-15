@@ -90,7 +90,11 @@ class TasteProfile:
     affinities: dict[str, dict[str, float]] = field(default_factory=dict)
     aspect_affinity: dict[str, float] = field(default_factory=dict)
     scale_targets: dict[str, float] = field(default_factory=dict)
+    # Signed: the sign says whether more of this scale is better or worse.
     scale_weights: dict[str, float] = field(default_factory=dict)
+    # Where each scale sits on average across the films rated, so the ranking
+    # feature is centred and an absent dossier can score a neutral zero.
+    scale_pivots: dict[str, float] = field(default_factory=dict)
     taste_signals: list[str] = field(default_factory=list)
     summary: dict[str, Any] | None = None
     embed_model: str = ""
@@ -106,13 +110,28 @@ class TasteProfile:
             "rating_mean": round(self.rating_mean, 4),
             "rating_std": round(self.rating_std, 4),
             "modes": [m.to_json() for m in self.modes],
+            # Was truncated to the 80 largest per facet, which - because the
+            # largest values are the ones with a single observation behind them
+            # - kept the noise and discarded the evidence. The ranker is fitted
+            # on the full table in memory, so the truncation was also a straight
+            # train/serve skew. Cheap to store in full: a few hundred KB.
             "affinities": {
-                k: {n: round(v, 4) for n, v in sorted(d.items(), key=lambda t: -abs(t[1]))[:80]}
-                for k, d in self.affinities.items()
+                k: {n: round(v, 4) for n, v in d.items()} for k, d in self.affinities.items()
+            },
+            # The raw counts behind those values. Without them a profile read
+            # back from the database cannot do leave-one-out at all, and the
+            # correction silently became a no-op.
+            "affinity_stats": {
+                facet: {
+                    name: [round(float(total), 6), int(count)]
+                    for name, (total, count) in values.items()
+                }
+                for facet, values in self.affinity_stats.items()
             },
             "aspect_affinity": {k: round(v, 4) for k, v in self.aspect_affinity.items()},
             "scale_targets": {k: round(v, 4) for k, v in self.scale_targets.items()},
             "scale_weights": {k: round(v, 4) for k, v in self.scale_weights.items()},
+            "scale_pivots": {k: round(v, 4) for k, v in self.scale_pivots.items()},
             "taste_signals": self.taste_signals,
             "summary": self.summary,
             "embed_model": self.embed_model,
@@ -121,6 +140,12 @@ class TasteProfile:
 
     def affinity(self, facet: str, name: str) -> float:
         return self.affinities.get(facet, {}).get(name, 0.0)
+
+
+# Below this many rated films carrying a scale, there is nothing to measure.
+MIN_SCALE_SAMPLES = 8
+# And below this correlation, what is measured is sampling noise.
+MIN_SCALE_CORRELATION = 0.10
 
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +161,7 @@ def load_user_ratings(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         FROM user_ratings r
         JOIN user_films f USING(film_key)
         WHERE f.tmdb_id IS NOT NULL
+        ORDER BY f.tmdb_id
         """,
     )
     return [dict(r) for r in rows]
@@ -331,10 +357,14 @@ def build_taste_modes(
     titles: dict[int, tuple[str, int | None, float]],
 ) -> list[TasteMode]:
     """Cluster the films the user liked into distinct modes of taste."""
-    liked = [(i, p) for i, p in prefs.items() if p >= LIKED_THRESHOLD and i in vectors]
+    # Sorted, because k-means++ seeds from row order: the same ratings arriving
+    # in a different order produced different clusters, different mode weights
+    # and therefore a different candidate pool. `prefs` comes from a dict built
+    # off a SQL scan, so its order is whatever the query planner chose that day.
+    liked = sorted(((i, p) for i, p in prefs.items() if p >= LIKED_THRESHOLD and i in vectors))
     if len(liked) < MIN_MODE_SIZE * 2:
         # Not enough evidence to split: one mode over everything positive.
-        pool = liked or [(i, p) for i, p in prefs.items() if i in vectors]
+        pool = liked or sorted((i, p) for i, p in prefs.items() if i in vectors)
         if not pool:
             return []
         mat = np.vstack([vectors[i] for i, _ in pool])
@@ -383,12 +413,15 @@ def _make_mode(mode_id, member_ids, centroid, weight, facets, titles) -> TasteMo
     tag_counts: dict[str, int] = defaultdict(int)
     genre_counts: dict[str, int] = defaultdict(int)
     for i in member_ids:
-        for t in set(facets.get(i, {}).get("tag", [])):
+        for t in sorted(set(facets.get(i, {}).get("tag", []))):
             tag_counts[t] += 1
-        for g in set(facets.get(i, {}).get("genre", [])):
+        for g in sorted(set(facets.get(i, {}).get("genre", []))):
             genre_counts[g] += 1
-    top_tags = [t for t, _ in sorted(tag_counts.items(), key=lambda x: -x[1])[:6]]
-    top_genres = [g for g, _ in sorted(genre_counts.items(), key=lambda x: -x[1])[:4]]
+    # Ties broken by name: counting alone left the label dependent on dict order,
+    # so the same cluster was described differently from one run to the next -
+    # and the label is user-facing and goes into the prompt sent to Claude.
+    top_tags = [t for t, _ in sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))[:6]]
+    top_genres = [g for g, _ in sorted(genre_counts.items(), key=lambda x: (-x[1], x[0]))[:4]]
     exemplars = sorted(
         (
             {
@@ -459,15 +492,30 @@ def aggregate_review_facts(facts_rows: list[dict[str, Any]]) -> tuple[dict[str, 
 
 def scale_preferences(
     prefs: dict[int, float], dossiers: dict[int, dict[str, Any]]
-) -> tuple[dict[str, float], dict[str, float]]:
-    """Preferred value and importance for each dossier scale.
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """Preferred value, direction and pivot for each dossier scale.
 
-    The target is the preference-weighted mean of the scale among films the user
-    rated; the weight is how strongly the scale correlates with preference,
-    which is what tells the ranker whether the user actually cares about it.
+    Three numbers per scale:
+
+    * ``target`` - the preference-weighted mean, i.e. roughly where this
+      viewer's liked films sit. Shown in the UI and used to match an explicit
+      request ("nothing bleak"), so it stays a value on the original 0-1 scale.
+    * ``weight`` - the **signed** correlation with preference, scaled by how
+      much evidence there is. The sign is the point: it says whether more of
+      this is better or worse.
+    * ``pivot`` - the plain mean of the scale over the films rated, so the
+      ranking feature can be centred and "no dossier" can mean "no evidence"
+      rather than "the worst possible film".
+
+    The weight used to be ``abs(r)``, and the ranking feature scored distance
+    from the target. That cannot express "more is better": a viewer who likes
+    spectacle more, the more of it there is, was modelled as preferring average
+    spectacle. On real data the resulting feature correlated -0.02 with
+    preference where the signed form reaches +0.44.
     """
     targets: dict[str, float] = {}
     weights: dict[str, float] = {}
+    pivots: dict[str, float] = {}
     for scale in DOSSIER_SCALES:
         xs, ys = [], []
         for tmdb_id, pref in prefs.items():
@@ -479,19 +527,26 @@ def scale_preferences(
                 continue
             xs.append(float(value))
             ys.append(float(pref))
-        if len(xs) < 8:
+        if len(xs) < MIN_SCALE_SAMPLES:
             continue
         x = np.array(xs)
         y = np.array(ys)
         # Preference-weighted mean, using softmax-ish positive weights.
         w = np.exp(np.clip(y, -2, 2))
         targets[scale] = float((x * w).sum() / w.sum())
+        pivots[scale] = float(x.mean())
         if x.std() > 1e-6 and y.std() > 1e-6:
             r = float(np.corrcoef(x, y)[0, 1])
-            weights[scale] = 0.0 if math.isnan(r) else abs(r) * min(1.0, len(xs) / 40.0)
+            if math.isnan(r) or abs(r) < MIN_SCALE_CORRELATION:
+                # Below this, the correlation is indistinguishable from sampling
+                # noise on a couple of hundred ratings, and letting it through
+                # just injects it into every candidate's score.
+                weights[scale] = 0.0
+            else:
+                weights[scale] = r * min(1.0, len(xs) / 40.0)
         else:
             weights[scale] = 0.0
-    return targets, weights
+    return targets, weights, pivots
 
 
 # --------------------------------------------------------------------------- #
@@ -529,7 +584,9 @@ def build_profile_from_prefs(
     profile.affinity_stats = compute_affinity_stats(prefs, facets)
     profile.affinities = affinities_from_stats(profile.affinity_stats)
     profile.modes = build_taste_modes(conn, prefs, vectors, facets, titles)
-    profile.scale_targets, profile.scale_weights = scale_preferences(prefs, dossiers)
+    profile.scale_targets, profile.scale_weights, profile.scale_pivots = scale_preferences(
+        prefs, dossiers
+    )
 
     if review_rows is not None:
         profile.aspect_affinity, profile.taste_signals = aggregate_review_facts(review_rows)
@@ -637,11 +694,20 @@ def load_profile(conn: sqlite3.Connection, backend_name: str | None = None) -> T
         aspect_affinity=payload.get("aspect_affinity", {}),
         scale_targets=payload.get("scale_targets", {}),
         scale_weights=payload.get("scale_weights", {}),
+        scale_pivots=payload.get("scale_pivots", {}),
         taste_signals=payload.get("taste_signals", []),
         # Normalised on read as well as on write, so a profile already stored
         # with a malformed summary is repaired without paying to regenerate it.
         summary=normalize_summary(payload["summary"]) if payload.get("summary") else None,
         embed_model=payload.get("embed_model", ""),
+        dislike_member_ids=[int(i) for i in payload.get("dislike_member_ids", [])],
+        # Restored so leave-one-out still works on a profile read back from the
+        # database. Without these the correction quietly did nothing, and a
+        # training run against a loaded profile scored films against themselves.
+        affinity_stats={
+            facet: {name: (float(v[0]), int(v[1])) for name, v in values.items()}
+            for facet, values in (payload.get("affinity_stats") or {}).items()
+        },
     )
     vec_rows = fetch_all(
         conn,
@@ -663,6 +729,7 @@ def load_profile(conn: sqlite3.Connection, backend_name: str | None = None) -> T
                 exemplars=m.get("exemplars", []),
                 top_tags=m.get("top_tags", []),
                 top_genres=m.get("top_genres", []),
+                member_ids=[int(i) for i in m.get("member_ids", [])],
             )
         )
     # Weights are stored rounded, so renormalise: downstream code takes weighted

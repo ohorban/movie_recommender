@@ -643,14 +643,17 @@ class RecommendationEngine:
         _top("tag", 6, "Qualities they reward when a film has them", "Qualities that put them off")
         _top("decade", 2, "Decades they favour", "Decades they avoid", floor=0.2)
 
-        for key, weight in sorted(p.scale_weights.items(), key=lambda kv: -kv[1])[:4]:
+        for key, weight in sorted(p.scale_weights.items(), key=lambda kv: -abs(kv[1]))[:4]:
             target = p.scale_targets.get(key)
-            if target is None or weight < 0.1:
+            if target is None or abs(weight) < 0.1:
                 continue
-            band = " (high)" if target >= 0.6 else (" (low)" if target <= 0.4 else "")
+            # The weight is signed, and the sign is the useful part: it says
+            # which way this viewer leans, not merely that they notice.
+            direction = "the more of it the better" if weight > 0 else "the less of it the better"
             lines.append(
-                f"- {key.replace('_', ' ').capitalize()} is one of the axes that most predicts "
-                f"their rating (weight {weight:.2f}); their sweet spot is {target:.2f} of 1{band}"
+                f"- {key.replace('_', ' ').capitalize()} predicts their rating "
+                f"({direction}, strength {abs(weight):.2f}); their films average "
+                f"{target:.2f} of 1 on it"
             )
 
         aspects = sorted(p.aspect_affinity.items(), key=lambda kv: -kv[1])
